@@ -1,0 +1,487 @@
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "bun:test";
+import { SQL } from "bun";
+import { IdempotencyConflictError } from "../../src/application/errors/idempotency-conflict-error";
+import { IdempotencyInProgressError } from "../../src/application/errors/idempotency-in-progress-error";
+import {
+  ProviderRejectedError,
+  ProviderTimeoutError,
+} from "../../src/application/errors/provider-errors";
+import { createRequestFingerprint } from "../../src/application/idempotency/request-fingerprint";
+import type {
+  PaymentProvider,
+  ProviderResult,
+} from "../../src/application/ports/payment-provider";
+import { CreateTransaction } from "../../src/application/use-cases/create-transaction";
+import type { Transaction } from "../../src/domain/transaction";
+import { runMigrations } from "../../src/infrastructure/database/migrate";
+import { PostgresTransactionRepository } from "../../src/infrastructure/repositories/postgres-transaction-repository";
+
+const databaseUrl = Bun.env.TEST_DATABASE_URL;
+const describeWithPostgres =
+  databaseUrl === undefined ? describe.skip : describe;
+const fingerprint = "a".repeat(64);
+const baseTime = new Date("2026-01-01T00:00:00.000Z");
+
+function transaction(
+  id: string,
+  createdAt = baseTime,
+  description = "Order 123",
+): Transaction {
+  return {
+    id,
+    amount: 1099,
+    currency: "BRL",
+    description,
+    status: "approved",
+    providerTransactionId: `provider-${id}`,
+    createdAt,
+  };
+}
+
+class ControlledProvider implements PaymentProvider {
+  calls = 0;
+  keys: string[] = [];
+  error: Error | null = null;
+  delayMs = 0;
+  result: ProviderResult = {
+    providerTransactionId: "provider-result-1",
+    decision: "approved",
+  };
+
+  async process(
+    _transaction: Parameters<PaymentProvider["process"]>[0],
+    idempotencyKey: string,
+  ): Promise<ProviderResult> {
+    this.calls += 1;
+    this.keys.push(idempotencyKey);
+    if (this.delayMs > 0) {
+      await Bun.sleep(this.delayMs);
+    }
+    if (this.error !== null) {
+      throw this.error;
+    }
+
+    return this.result;
+  }
+}
+
+describeWithPostgres("PostgresTransactionRepository", () => {
+  let sql: SQL;
+  let repository: PostgresTransactionRepository;
+
+  beforeAll(async () => {
+    sql = new SQL(databaseUrl as string, { max: 20 });
+    await sql.unsafe(
+      "DROP TABLE IF EXISTS idempotency_operations, transactions, schema_migrations CASCADE",
+    );
+    await runMigrations(sql);
+    repository = new PostgresTransactionRepository(sql);
+  });
+
+  beforeEach(async () => {
+    await sql`TRUNCATE TABLE idempotency_operations, transactions`;
+  });
+
+  afterAll(async () => {
+    await sql.close();
+  });
+
+  test("applies versioned migrations from an empty database and is idempotent", async () => {
+    await runMigrations(sql);
+    const tables = await sql<{ table_name: string }[]>`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name IN (
+          'transactions',
+          'idempotency_operations',
+          'schema_migrations'
+        )
+      ORDER BY table_name
+    `;
+    const migrations = await sql<{ version: string }[]>`
+      SELECT version FROM schema_migrations ORDER BY version
+    `;
+    const uniqueKey = await sql<{ constraint_type: string }[]>`
+      SELECT constraint_type
+      FROM information_schema.table_constraints
+      WHERE table_schema = 'public'
+        AND table_name = 'idempotency_operations'
+        AND constraint_name = 'idempotency_operations_pkey'
+    `;
+
+    expect(tables.map((row) => row.table_name)).toEqual([
+      "idempotency_operations",
+      "schema_migrations",
+      "transactions",
+    ]);
+    expect(migrations).toHaveLength(1);
+    expect(migrations[0]?.version).toBe(
+      "001_create_transactions_and_idempotency_operations.sql",
+    );
+    expect(uniqueKey[0]?.constraint_type).toBe("PRIMARY KEY");
+  });
+
+  test("persists a transaction and returns a completed replay", async () => {
+    const result = transaction("00000000-0000-4000-8000-000000000001");
+    expect(
+      await repository.claimIdempotencyOperation({
+        idempotencyKey: "replay-key",
+        requestFingerprint: fingerprint,
+        claimedAt: baseTime,
+        staleBefore: new Date(baseTime.getTime() - 30_000),
+      }),
+    ).toEqual({ kind: "new_claim" });
+
+    await repository.completeIdempotencyOperation({
+      idempotencyKey: "replay-key",
+      requestFingerprint: fingerprint,
+      transaction: result,
+      completedAt: baseTime,
+    });
+
+    expect(await repository.findById(result.id)).toEqual(result);
+    expect(
+      await repository.claimIdempotencyOperation({
+        idempotencyKey: "replay-key",
+        requestFingerprint: fingerprint,
+        claimedAt: new Date(baseTime.getTime() + 1_000),
+        staleBefore: new Date(baseTime.getTime() - 29_000),
+      }),
+    ).toEqual({ kind: "completed_replay", transaction: result });
+  });
+
+  test("returns fingerprint conflict and never reuses the prior result", async () => {
+    await repository.claimIdempotencyOperation({
+      idempotencyKey: "conflict-key",
+      requestFingerprint: fingerprint,
+      claimedAt: baseTime,
+      staleBefore: new Date(baseTime.getTime() - 30_000),
+    });
+
+    expect(
+      await repository.claimIdempotencyOperation({
+        idempotencyKey: "conflict-key",
+        requestFingerprint: "b".repeat(64),
+        claimedAt: new Date(baseTime.getTime() + 1_000),
+        staleBefore: new Date(baseTime.getTime() - 29_000),
+      }),
+    ).toEqual({ kind: "fingerprint_conflict" });
+  });
+
+  test("same key with a different payload raises conflict without another provider call", async () => {
+    const provider = new ControlledProvider();
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000005" },
+      { now: () => baseTime },
+      30_000,
+    );
+    const first = await useCase.execute(
+      { amount: 1099, currency: "BRL", description: "Original" },
+      "payload-conflict-key",
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Changed" },
+        "payload-conflict-key",
+      ),
+    ).rejects.toBeInstanceOf(IdempotencyConflictError);
+
+    expect(first.created).toBeTrue();
+    expect(provider.calls).toBe(1);
+    expect(await repository.count()).toBe(1);
+  });
+
+  test("uses the UNIQUE key to allow exactly one new claim under 20 concurrent attempts", async () => {
+    const claims = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        repository.claimIdempotencyOperation({
+          idempotencyKey: "concurrent-claim-key",
+          requestFingerprint: fingerprint,
+          claimedAt: baseTime,
+          staleBefore: new Date(baseTime.getTime() - 30_000),
+        }),
+      ),
+    );
+    const operationCount = await sql<{ total: number | string }[]>`
+      SELECT COUNT(*) AS total
+      FROM idempotency_operations
+      WHERE idempotency_key = 'concurrent-claim-key'
+    `;
+
+    expect(claims.filter((claim) => claim.kind === "new_claim")).toHaveLength(1);
+    expect(claims.filter((claim) => claim.kind === "processing")).toHaveLength(19);
+    expect(Number(operationCount[0]?.total)).toBe(1);
+  });
+
+  test("allows only one provider call during concurrent CreateTransaction executions", async () => {
+    const provider = new ControlledProvider();
+    provider.delayMs = 150;
+    let generatedId = 0;
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      {
+        generate: () => {
+          generatedId += 1;
+          return `00000000-0000-4000-8000-${String(generatedId).padStart(12, "0")}`;
+        },
+      },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    const executions = await Promise.allSettled(
+      Array.from({ length: 20 }, () =>
+        useCase.execute(
+          { amount: 1099, currency: "BRL", description: "Concurrent" },
+          "concurrent-use-case-key",
+        ),
+      ),
+    );
+    const fulfilled = executions.filter((result) => result.status === "fulfilled");
+    const rejected = executions.filter((result) => result.status === "rejected");
+
+    expect(provider.calls).toBe(1);
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(19);
+    expect(
+      rejected.every(
+        (result) =>
+          result.status === "rejected" &&
+          result.reason instanceof IdempotencyInProgressError,
+      ),
+    ).toBeTrue();
+    expect(await repository.count()).toBe(1);
+  });
+
+  test("does not call the provider when another operation is already processing", async () => {
+    await repository.claimIdempotencyOperation({
+      idempotencyKey: "already-processing-key",
+      requestFingerprint:
+        "a2e97cad2002b1babda12974e1821c08b3e416573a9bdcb33b74b6b4852ae10f",
+      claimedAt: baseTime,
+      staleBefore: new Date(baseTime.getTime() - 30_000),
+    });
+    const provider = new ControlledProvider();
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000010" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Order 123" },
+        "already-processing-key",
+      ),
+    ).rejects.toBeInstanceOf(IdempotencyInProgressError);
+    expect(provider.calls).toBe(0);
+    expect(await repository.count()).toBe(0);
+  });
+
+  test("a provider rejection releases the operation and creates no transaction", async () => {
+    const provider = new ControlledProvider();
+    provider.error = new ProviderRejectedError();
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000011" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Rejected" },
+        "rejected-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderRejectedError);
+    const operations = await sql<{ total: number | string }[]>`
+      SELECT COUNT(*) AS total FROM idempotency_operations
+    `;
+
+    expect(await repository.count()).toBe(0);
+    expect(Number(operations[0]?.total)).toBe(0);
+  });
+
+  test("an ambiguous timeout keeps processing and can be reclaimed only after its lease", async () => {
+    const timeoutFingerprint = await createRequestFingerprint({
+      amount: 1099,
+      currency: "BRL",
+      description: "Timeout",
+    });
+    const provider = new ControlledProvider();
+    provider.error = new ProviderTimeoutError();
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000012" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Timeout" },
+        "timeout-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderTimeoutError);
+    expect(await repository.count()).toBe(0);
+
+    const active = await repository.claimIdempotencyOperation({
+      idempotencyKey: "timeout-key",
+      requestFingerprint: timeoutFingerprint,
+      claimedAt: new Date(baseTime.getTime() + 10_000),
+      staleBefore: new Date(baseTime.getTime() - 20_000),
+    });
+    const reclaimed = await repository.claimIdempotencyOperation({
+      idempotencyKey: "timeout-key",
+      requestFingerprint: timeoutFingerprint,
+      claimedAt: new Date(baseTime.getTime() + 31_000),
+      staleBefore: new Date(baseTime.getTime() + 1_000),
+    });
+
+    expect(active).toEqual({ kind: "processing" });
+    expect(reclaimed).toEqual({ kind: "new_claim" });
+  });
+
+  test("rolls back a failed completion and recovers by reclaiming with the same provider key", async () => {
+    const occupiedId = "00000000-0000-4000-8000-000000000020";
+    await repository.claimIdempotencyOperation({
+      idempotencyKey: "occupied-key",
+      requestFingerprint: fingerprint,
+      claimedAt: baseTime,
+      staleBefore: new Date(baseTime.getTime() - 30_000),
+    });
+    await repository.completeIdempotencyOperation({
+      idempotencyKey: "occupied-key",
+      requestFingerprint: fingerprint,
+      transaction: transaction(occupiedId),
+      completedAt: baseTime,
+    });
+
+    const provider = new ControlledProvider();
+    const firstAttempt = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => occupiedId },
+      { now: () => new Date(baseTime.getTime() + 1_000) },
+      30_000,
+    );
+    await expect(
+      firstAttempt.execute(
+        { amount: 1099, currency: "BRL", description: "Recovery" },
+        "recovery-key",
+      ),
+    ).rejects.toBeDefined();
+    expect(await repository.count()).toBe(1);
+
+    const operationAfterFailure = await sql<
+      { status: string; transaction_id: string | null }[]
+    >`
+      SELECT status, transaction_id
+      FROM idempotency_operations
+      WHERE idempotency_key = 'recovery-key'
+    `;
+    expect(operationAfterFailure[0]).toEqual({
+      status: "processing",
+      transaction_id: null,
+    });
+
+    const recovered = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000021" },
+      { now: () => new Date(baseTime.getTime() + 32_000) },
+      30_000,
+    );
+    const result = await recovered.execute(
+      { amount: 1099, currency: "BRL", description: "Recovery" },
+      "recovery-key",
+    );
+
+    expect(result.created).toBeTrue();
+    expect(provider.keys).toEqual(["recovery-key", "recovery-key"]);
+    expect(await repository.count()).toBe(2);
+  });
+
+  test("lists with stable created_at and id ordering and preserves pagination", async () => {
+    const entries = [
+      transaction(
+        "00000000-0000-4000-8000-000000000031",
+        new Date("2026-01-01T00:00:00.000Z"),
+      ),
+      transaction(
+        "00000000-0000-4000-8000-000000000032",
+        new Date("2026-01-02T00:00:00.000Z"),
+      ),
+      transaction(
+        "00000000-0000-4000-8000-000000000033",
+        new Date("2026-01-02T00:00:00.000Z"),
+      ),
+    ];
+    for (const [index, entry] of entries.entries()) {
+      const key = `list-key-${index}`;
+      await repository.claimIdempotencyOperation({
+        idempotencyKey: key,
+        requestFingerprint: fingerprint,
+        claimedAt: entry.createdAt,
+        staleBefore: new Date(entry.createdAt.getTime() - 30_000),
+      });
+      await repository.completeIdempotencyOperation({
+        idempotencyKey: key,
+        requestFingerprint: fingerprint,
+        transaction: entry,
+        completedAt: entry.createdAt,
+      });
+    }
+
+    expect((await repository.list(0, 2)).map((item) => item.id)).toEqual([
+      "00000000-0000-4000-8000-000000000033",
+      "00000000-0000-4000-8000-000000000032",
+    ]);
+    expect((await repository.list(2, 2)).map((item) => item.id)).toEqual([
+      "00000000-0000-4000-8000-000000000031",
+    ]);
+    expect(await repository.count()).toBe(3);
+  });
+
+  test("a new repository instance replays completed state from PostgreSQL", async () => {
+    const result = transaction("00000000-0000-4000-8000-000000000040");
+    await repository.claimIdempotencyOperation({
+      idempotencyKey: "restart-key",
+      requestFingerprint: fingerprint,
+      claimedAt: baseTime,
+      staleBefore: new Date(baseTime.getTime() - 30_000),
+    });
+    await repository.completeIdempotencyOperation({
+      idempotencyKey: "restart-key",
+      requestFingerprint: fingerprint,
+      transaction: result,
+      completedAt: baseTime,
+    });
+
+    const repositoryAfterRestart = new PostgresTransactionRepository(sql);
+    expect(
+      await repositoryAfterRestart.claimIdempotencyOperation({
+        idempotencyKey: "restart-key",
+        requestFingerprint: fingerprint,
+        claimedAt: new Date(baseTime.getTime() + 1_000),
+        staleBefore: new Date(baseTime.getTime() - 29_000),
+      }),
+    ).toEqual({ kind: "completed_replay", transaction: result });
+  });
+});

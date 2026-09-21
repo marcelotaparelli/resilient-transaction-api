@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/main.ts",
+    "migrate": "bun src/infrastructure/database/migrate.ts",
     "provider": "bun --watch src/dev/provider.ts",
     "test": "bun test",
+    "test:integration": "bun test tests/integration",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
