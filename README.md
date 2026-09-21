@@ -1,13 +1,13 @@
 # resilient-transaction-api
 
-API de processamento de transações construída com Bun, TypeScript, PostgreSQL, Redis e Clean Architecture. O projeto demonstra dinheiro em minor units, integração externa resiliente, cache-aside, rate limiting distribuído e idempotência com garantia de concorrência baseada em constraints e operações atômicas do banco.
+API de processamento de transações construída com Bun, TypeScript, PostgreSQL, Redis e Clean Architecture. O projeto demonstra dinheiro em minor units, autenticação entre serviços, fronteiras HTTP explícitas, integração externa resiliente, cache-aside, rate limiting distribuído e idempotência com garantia de concorrência baseada em constraints e operações atômicas do banco.
 
 Este é um case de engenharia. Não é um sistema financeiro real e não implementa ledger, settlement, chargeback, antifraude ou PCI DSS.
 
 ## Arquitetura atual
 
 ```text
-Client
+Authenticated service
    ↓
 Bun HTTP handler
    ↓
@@ -112,9 +112,20 @@ Há um índice correspondente. A paginação continua baseada em `page` e `limit
 ## HTTP
 
 - `GET /health`
+- `GET /health/live`
 - `POST /transactions`
 - `GET /transactions/:id`
 - `GET /transactions?page=1&limit=20`
+
+As três rotas de negócio exigem `Authorization: Bearer <service-api-key>`. A configuração associa o SHA-256 de uma API key aleatória e de alta entropia a um `serviceId` estável. O segredo bruto não fica no código, não entra em Redis e não é propagado depois da autenticação. A comparação usa `timingSafeEqual` sobre digests de tamanho fixo; isso reduz diferenças triviais de comparação, sem prometer proteção total contra timing attacks.
+
+O `serviceId` autenticado é o subject do rate limiter. `X-Client-Id` é ignorado e não consegue mudar o bucket, contornar o limite ou substituir autenticação. Serviços diferentes têm buckets independentes.
+
+`GET /health` e `GET /health/live` permanecem públicos e retornam somente o estado do processo, permitindo probes sem distribuir credenciais. Readiness completo será conectado às dependências na fase operacional; ele não é simulado por uma resposta que poderia ser enganosa.
+
+POST aceita apenas `application/json` ou `application/json; charset=utf-8`. O body tem limite default de 16 KiB, verificado pelo `Content-Length` quando presente e novamente durante o consumo do stream. Body acima do limite retorna `413 PAYLOAD_TOO_LARGE`, media type ausente ou não suportado retorna `415 UNSUPPORTED_MEDIA_TYPE`, e JSON malformado retorna `400 INVALID_JSON`.
+
+Headers e inputs relevantes são bounded: Authorization até 512 caracteres, token Bearer entre 32 e 256, Idempotency-Key entre 1 e 128 com caracteres alfanuméricos e `._:-`, description até 200, page até 1.000.000 e limit até 100. UUIDs, query, body e configuração são validados estritamente. Métodos ou paths não implementados retornam 404.
 
 Erros preservam o envelope:
 
@@ -127,9 +138,9 @@ Erros preservam o envelope:
 }
 ```
 
-SQL, connection strings, erros brutos e stack traces não são enviados ao cliente.
+SQL, connection strings, erros brutos, nomes internos e stack traces não são enviados ao cliente. Erros desconhecidos sempre retornam `500 INTERNAL_ERROR`. Campos de log que possam conter Authorization, API keys, credentials, secrets, URLs de PostgreSQL/Redis, Idempotency-Key ou payload completo passam por redaction centralizada. O logging estruturado completo continua reservado à fase de observabilidade.
 
-`X-Client-Id` identifica somente o bucket distribuído do rate limiter. Ele é controlado pelo cliente e não representa autenticação ou identidade confiável.
+A revisão da Fase 5 confirmou que inputs usados pelo repository continuam em tagged templates parametrizados do `Bun.SQL`; `sql.unsafe` recebe somente migrations versionadas e SQL estático de setup de testes. URL, timeout, retry e credentials do provider vêm da configuração validada no composition root e não podem ser alterados pelo caller. Prefixos Redis são validados, o `serviceId` é bounded e codificado, IDs de transação são validados antes do cache e payloads cacheados continuam sujeitos ao schema estrito.
 
 ## Redis: responsabilidades e limites
 
@@ -138,7 +149,7 @@ O projeto usa `Bun.RedisClient`, sem biblioteca externa. A escolha e os trade-of
 Os namespaces não se misturam:
 
 ```text
-rate-limit:v1:<encoded-client-id>
+rate-limit:v1:<encoded-service-id>
 transaction-cache:v1:<transaction-id>
 ```
 
@@ -150,7 +161,7 @@ O algoritmo é fixed window iniciada no primeiro request. Um script Lua executa 
 
 Acima do limite, a API retorna HTTP `429`, código `RATE_LIMIT_EXCEEDED` e `Retry-After` derivado do `PTTL` real da key.
 
-A política é fail-open. Se Redis estiver lento, indisponível ou retornar algo inválido, a request prossegue sem rate limiting e um aviso operacional JSON, sem erro bruto ou identifiers, é emitido. Para este case, uma degradação temporária da proteção contra abuso é preferível a derrubar PostgreSQL e provider junto com uma dependência operacional. Autenticação será tratada separadamente; `X-Client-Id` continua não confiável.
+A política é fail-open. Se Redis estiver lento, indisponível ou retornar algo inválido, a request prossegue sem rate limiting e um aviso operacional JSON, sem erro bruto ou identifiers, é emitido. Para este case, uma degradação temporária da proteção contra abuso é preferível a derrubar PostgreSQL e provider junto com uma dependência operacional. Autenticação ocorre antes e não usa Redis, portanto continua obrigatória durante essa degradação.
 
 ### Cache-aside
 
@@ -217,6 +228,8 @@ O fake provider mantém sua própria idempotência em memória. Nos cenários `t
 
 | Variável | Default |
 | --- | ---: |
+| `SERVICE_CREDENTIALS` | obrigatório; JSON sem default |
+| `HTTP_MAX_BODY_BYTES` | `16384` |
 | `PROVIDER_URL` | `http://localhost:4003/transactions` |
 | `PROVIDER_TIMEOUT_MS` | `3000` |
 | `PROVIDER_MAX_ATTEMPTS` | `3` |
@@ -248,6 +261,7 @@ Pré-requisitos:
 bun install
 export DATABASE_URL='postgres://user:password@localhost:5432/resilient_transactions'
 export REDIS_URL='redis://localhost:6379'
+export SERVICE_CREDENTIALS='[{"serviceId":"orders-service","apiKeySha256":"<sha256-hex>"}]'
 bun run migrate
 ```
 
@@ -270,7 +284,7 @@ A API usa `http://localhost:4002`; o provider usa `http://localhost:4003`.
 ```bash
 curl -i -X POST http://localhost:4002/transactions \
   -H 'Content-Type: application/json' \
-  -H 'X-Client-Id: client-123' \
+  -H 'Authorization: Bearer <service-api-key>' \
   -H 'Idempotency-Key: tx-123' \
   -d '{"amount":1099,"currency":"BRL","description":"Order 123"}'
 ```
@@ -299,12 +313,12 @@ A suíte de integração aplica migrations a partir de vazio, testa constraints,
 
 - a correção do side effect externo depende da idempotência oferecida pelo provider;
 - o reclaim usa lease por tempo e pressupõe relógios razoavelmente sincronizados;
-- não há autenticação;
+- credentials são API keys estáticas por serviço, sem expiração ou autorização por rota;
+- rotação exige sobreposição de hashes na configuração e rollout;
 - rate limiting fica fail-open durante indisponibilidade do Redis;
 - misses concorrentes podem consultar PostgreSQL simultaneamente;
 - o cliente Redis nativo não suporta Redis Cluster ou Sentinel;
 - o circuit breaker é local por réplica e perde estado no restart;
 - clocks pausados, clock skew extremo ou stalls do runtime ainda podem ultrapassar a margem do stale timeout;
-- não há limite explícito de bytes do body;
 - não há observabilidade avançada ou graceful shutdown;
 - não há Docker ou infraestrutura AWS.
