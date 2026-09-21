@@ -1,6 +1,10 @@
 import {
+  ProviderCircuitOpenError,
   ProviderInvalidResponseError,
+  ProviderNetworkError,
+  ProviderRateLimitedError,
   ProviderRejectedError,
+  ProviderServerError,
   ProviderTimeoutError,
   ProviderUnavailableError,
 } from "../application/errors/provider-errors";
@@ -61,7 +65,13 @@ export function mapApplicationError(error: unknown): Response {
     return errorResponse("PROVIDER_TIMEOUT", "Payment provider timed out", 504);
   }
 
-  if (error instanceof ProviderUnavailableError) {
+  if (
+    error instanceof ProviderUnavailableError ||
+    error instanceof ProviderNetworkError ||
+    error instanceof ProviderRateLimitedError ||
+    error instanceof ProviderServerError ||
+    error instanceof ProviderCircuitOpenError
+  ) {
     return errorResponse(
       "PROVIDER_UNAVAILABLE",
       "Payment provider is unavailable",

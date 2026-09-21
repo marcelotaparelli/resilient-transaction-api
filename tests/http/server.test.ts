@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  ProviderCircuitOpenError,
   ProviderInvalidResponseError,
+  ProviderNetworkError,
+  ProviderRateLimitedError,
   ProviderRejectedError,
+  ProviderServerError,
   ProviderTimeoutError,
   ProviderUnavailableError,
 } from "../../src/application/errors/provider-errors";
@@ -114,6 +118,10 @@ describe("createHttpHandler", () => {
     const cases = [
       [new ProviderTimeoutError(), 504, "PROVIDER_TIMEOUT"],
       [new ProviderUnavailableError(), 503, "PROVIDER_UNAVAILABLE"],
+      [new ProviderNetworkError(), 503, "PROVIDER_UNAVAILABLE"],
+      [new ProviderRateLimitedError(), 503, "PROVIDER_UNAVAILABLE"],
+      [new ProviderServerError(503), 503, "PROVIDER_UNAVAILABLE"],
+      [new ProviderCircuitOpenError(), 503, "PROVIDER_UNAVAILABLE"],
       [new ProviderInvalidResponseError(), 502, "PROVIDER_INVALID_RESPONSE"],
       [new ProviderRejectedError(), 502, "PROVIDER_REJECTED"],
     ] as const;

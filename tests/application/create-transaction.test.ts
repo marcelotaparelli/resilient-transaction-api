@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { IdempotencyConflictError } from "../../src/application/errors/idempotency-conflict-error";
 import { IdempotencyInProgressError } from "../../src/application/errors/idempotency-in-progress-error";
-import { ProviderRejectedError } from "../../src/application/errors/provider-errors";
+import {
+  ProviderCircuitOpenError,
+  ProviderInvalidResponseError,
+  ProviderRejectedError,
+} from "../../src/application/errors/provider-errors";
 import type {
   ClaimIdempotencyOperation,
   CompleteIdempotencyOperation,
@@ -200,5 +204,31 @@ describe("CreateTransaction", () => {
     ).rejects.toThrow("outcome unknown");
     expect(repository.completed).toBeNull();
     expect(repository.released).toBeNull();
+  });
+
+  test("an invalid provider response remains ambiguous and keeps processing", async () => {
+    const repository = new RepositoryStub();
+    const provider = new ProviderStub();
+    provider.error = new ProviderInvalidResponseError();
+    const useCase = createUseCase(repository, provider);
+
+    await expect(
+      useCase.execute(input, "idempotency-key"),
+    ).rejects.toBeInstanceOf(ProviderInvalidResponseError);
+    expect(repository.completed).toBeNull();
+    expect(repository.released).toBeNull();
+  });
+
+  test("a circuit-open refusal releases a new claim because no provider call started", async () => {
+    const repository = new RepositoryStub();
+    const provider = new ProviderStub();
+    provider.error = new ProviderCircuitOpenError();
+    const useCase = createUseCase(repository, provider);
+
+    await expect(
+      useCase.execute(input, "idempotency-key"),
+    ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+    expect(repository.completed).toBeNull();
+    expect(repository.released?.idempotencyKey).toBe("idempotency-key");
   });
 });

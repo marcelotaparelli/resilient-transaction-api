@@ -1,9 +1,11 @@
 import { z } from "zod";
 import {
   ProviderInvalidResponseError,
+  ProviderNetworkError,
+  ProviderRateLimitedError,
   ProviderRejectedError,
+  ProviderServerError,
   ProviderTimeoutError,
-  ProviderUnavailableError,
 } from "../../application/errors/provider-errors";
 import type {
   PaymentProvider,
@@ -11,52 +13,58 @@ import type {
 } from "../../application/ports/payment-provider";
 import type { TransactionInput } from "../../domain/transaction";
 
-const providerResponseSchema = z.object({
-  providerTransactionId: z.string().min(1),
-  decision: z.literal("approved"),
-}).strict();
+const providerResponseSchema = z
+  .object({
+    providerTransactionId: z.string().min(1),
+    decision: z.literal("approved"),
+  })
+  .strict();
+
+export interface ScheduledTimeout {
+  cancel(): void;
+}
+
+export interface TimeoutScheduler {
+  schedule(callback: () => void, delayMs: number): ScheduledTimeout;
+}
+
+export class RuntimeTimeoutScheduler implements TimeoutScheduler {
+  schedule(callback: () => void, delayMs: number): ScheduledTimeout {
+    const handle = setTimeout(callback, delayMs);
+    return { cancel: () => clearTimeout(handle) };
+  }
+}
+
+export type FetchRequest = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
 
 export class HttpPaymentProvider implements PaymentProvider {
   constructor(
     private readonly url: string,
     private readonly timeoutMs: number,
-    private readonly maxAttempts: number,
-    private readonly baseDelayMs: number,
-  ) {}
+    private readonly fetchRequest: FetchRequest = fetch,
+    private readonly timeoutScheduler: TimeoutScheduler =
+      new RuntimeTimeoutScheduler(),
+  ) {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+      throw new Error("Provider timeout must be a positive safe integer");
+    }
+  }
 
   async process(
     transaction: TransactionInput,
     idempotencyKey: string,
   ): Promise<ProviderResult> {
-    for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
-      try {
-        return await this.processAttempt(transaction, idempotencyKey);
-      } catch (error: unknown) {
-        const retryable =
-          error instanceof ProviderTimeoutError ||
-          error instanceof ProviderUnavailableError;
-
-        if (!retryable || attempt === this.maxAttempts) {
-          throw error;
-        }
-
-        const delay = this.baseDelayMs * 2 ** (attempt - 1);
-        await Bun.sleep(delay);
-      }
-    }
-
-    throw new ProviderUnavailableError();
-  }
-
-  private async processAttempt(
-    transaction: TransactionInput,
-    idempotencyKey: string,
-  ): Promise<ProviderResult> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timeout = this.timeoutScheduler.schedule(
+      () => controller.abort(),
+      this.timeoutMs,
+    );
 
     try {
-      const response = await fetch(this.url, {
+      const response = await this.fetchRequest(this.url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -66,12 +74,16 @@ export class HttpPaymentProvider implements PaymentProvider {
         signal: controller.signal,
       });
 
+      if (response.status === 429) {
+        throw new ProviderRateLimitedError();
+      }
+
       if (response.status >= 500) {
-        throw new ProviderUnavailableError();
+        throw new ProviderServerError(response.status);
       }
 
       if (!response.ok) {
-        throw new ProviderRejectedError();
+        throw new ProviderRejectedError(response.status);
       }
 
       let body: unknown;
@@ -90,8 +102,9 @@ export class HttpPaymentProvider implements PaymentProvider {
     } catch (error: unknown) {
       if (
         error instanceof ProviderInvalidResponseError ||
+        error instanceof ProviderRateLimitedError ||
         error instanceof ProviderRejectedError ||
-        error instanceof ProviderUnavailableError
+        error instanceof ProviderServerError
       ) {
         throw error;
       }
@@ -100,9 +113,9 @@ export class HttpPaymentProvider implements PaymentProvider {
         throw new ProviderTimeoutError();
       }
 
-      throw new ProviderUnavailableError();
+      throw new ProviderNetworkError();
     } finally {
-      clearTimeout(timeout);
+      timeout.cancel();
     }
   }
 }

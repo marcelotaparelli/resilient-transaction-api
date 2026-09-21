@@ -4,7 +4,10 @@ import type {
 } from "../../domain/transaction";
 import { IdempotencyConflictError } from "../errors/idempotency-conflict-error";
 import { IdempotencyInProgressError } from "../errors/idempotency-in-progress-error";
-import { ProviderRejectedError } from "../errors/provider-errors";
+import {
+  ProviderCircuitOpenError,
+  ProviderRejectedError,
+} from "../errors/provider-errors";
 import {
   createRequestFingerprint,
   normalizeTransactionInput,
@@ -66,7 +69,10 @@ export class CreateTransaction {
         idempotencyKey,
       );
     } catch (error: unknown) {
-      if (error instanceof ProviderRejectedError) {
+      if (
+        error instanceof ProviderRejectedError ||
+        error instanceof ProviderCircuitOpenError
+      ) {
         await this.transactionRepository.releaseIdempotencyOperation({
           idempotencyKey,
           requestFingerprint,
