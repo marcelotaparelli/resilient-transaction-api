@@ -5,6 +5,8 @@ import {
   ProviderTimeoutError,
   ProviderUnavailableError,
 } from "../../src/application/errors/provider-errors";
+import { IdempotencyConflictError } from "../../src/application/errors/idempotency-conflict-error";
+import { IdempotencyInProgressError } from "../../src/application/errors/idempotency-in-progress-error";
 import { TransactionNotFoundError } from "../../src/application/errors/transaction-not-found-error";
 import { createHttpHandler } from "../../src/http/server";
 import type { Transaction } from "../../src/domain/transaction";
@@ -130,6 +132,38 @@ describe("createHttpHandler", () => {
       expect(body.error.code).toBe(expectedCode);
       expect(body.error.message.length).toBeGreaterThan(0);
     }
+  });
+
+  test("maps idempotency conflict to a stable 409 envelope", async () => {
+    const deps = dependencies();
+    deps.createTransaction.execute = async () => {
+      throw new IdempotencyConflictError();
+    };
+
+    const response = await createHttpHandler(deps)(postRequest());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "IDEMPOTENCY_KEY_CONFLICT",
+        message: "Idempotency key was already used for a different transaction",
+      },
+    });
+  });
+
+  test("returns bounded processing response with Retry-After", async () => {
+    const deps = dependencies();
+    deps.createTransaction.execute = async () => {
+      throw new IdempotencyInProgressError();
+    };
+
+    const response = await createHttpHandler(deps)(postRequest());
+
+    expect(response.status).toBe(409);
+    expect(response.headers.get("Retry-After")).toBe("1");
+    expect(await response.json()).toMatchObject({
+      error: { code: "IDEMPOTENCY_OPERATION_IN_PROGRESS" },
+    });
   });
 
   test("does not expose unexpected error messages or stack traces", async () => {

@@ -4,6 +4,8 @@ import {
   ProviderTimeoutError,
   ProviderUnavailableError,
 } from "../application/errors/provider-errors";
+import { IdempotencyConflictError } from "../application/errors/idempotency-conflict-error";
+import { IdempotencyInProgressError } from "../application/errors/idempotency-in-progress-error";
 import { TransactionNotFoundError } from "../application/errors/transaction-not-found-error";
 
 type ErrorResponseOptions = {
@@ -30,6 +32,23 @@ export function errorResponse(
 }
 
 export function mapApplicationError(error: unknown): Response {
+  if (error instanceof IdempotencyConflictError) {
+    return errorResponse(
+      "IDEMPOTENCY_KEY_CONFLICT",
+      "Idempotency key was already used for a different transaction",
+      409,
+    );
+  }
+
+  if (error instanceof IdempotencyInProgressError) {
+    return errorResponse(
+      "IDEMPOTENCY_OPERATION_IN_PROGRESS",
+      "A transaction with this idempotency key is still processing",
+      409,
+      { headers: { "Retry-After": "1" } },
+    );
+  }
+
   if (error instanceof TransactionNotFoundError) {
     return errorResponse(
       "TRANSACTION_NOT_FOUND",
