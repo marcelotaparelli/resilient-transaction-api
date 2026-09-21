@@ -10,7 +10,9 @@ import { SQL } from "bun";
 import { IdempotencyConflictError } from "../../src/application/errors/idempotency-conflict-error";
 import { IdempotencyInProgressError } from "../../src/application/errors/idempotency-in-progress-error";
 import {
+  ProviderCircuitOpenError,
   ProviderRejectedError,
+  ProviderServerError,
   ProviderTimeoutError,
 } from "../../src/application/errors/provider-errors";
 import { createRequestFingerprint } from "../../src/application/idempotency/request-fingerprint";
@@ -20,7 +22,16 @@ import type {
 } from "../../src/application/ports/payment-provider";
 import { CreateTransaction } from "../../src/application/use-cases/create-transaction";
 import type { Transaction } from "../../src/domain/transaction";
+import { createFakeProviderHandler } from "../../src/dev/fake-provider";
 import { runMigrations } from "../../src/infrastructure/database/migrate";
+import { CircuitBreaker } from "../../src/infrastructure/providers/circuit-breaker";
+import {
+  HttpPaymentProvider,
+  type FetchRequest,
+  type TimeoutScheduler,
+} from "../../src/infrastructure/providers/http-payment-provider";
+import { ResilientPaymentProvider } from "../../src/infrastructure/providers/resilient-payment-provider";
+import { RetryPolicy } from "../../src/infrastructure/providers/retry-policy";
 import { PostgresTransactionRepository } from "../../src/infrastructure/repositories/postgres-transaction-repository";
 
 const databaseUrl = Bun.env.TEST_DATABASE_URL;
@@ -70,6 +81,44 @@ class ControlledProvider implements PaymentProvider {
 
     return this.result;
   }
+}
+
+function resilientFakeProvider(
+  outcomes: Parameters<typeof createFakeProviderHandler>[0]["outcomes"],
+  failureThreshold = 10,
+): {
+  provider: PaymentProvider;
+  breaker: CircuitBreaker;
+  keys: string[];
+} {
+  const handler = createFakeProviderHandler({ outcomes });
+  const keys: string[] = [];
+  const fetchRequest: FetchRequest = async (input, init) => {
+    const request = new Request(input, init);
+    keys.push(request.headers.get("Idempotency-Key") ?? "");
+    return handler(request);
+  };
+  const breaker = new CircuitBreaker(
+    { failureThreshold, openDurationMs: 1_000 },
+    { now: () => baseTime },
+  );
+  return {
+    provider: new ResilientPaymentProvider(
+      new HttpPaymentProvider("http://provider/transactions", 3_000, fetchRequest),
+      new RetryPolicy({
+        maxAttempts: 3,
+        attemptTimeoutMs: 3_000,
+        baseDelayMs: 500,
+        maxDelayMs: 2_000,
+        jitterRatio: 0.2,
+      }),
+      breaker,
+      { sleep: async () => undefined },
+      { next: () => 0 },
+    ),
+    breaker,
+    keys,
+  };
 }
 
 describeWithPostgres("PostgresTransactionRepository", () => {
@@ -483,5 +532,189 @@ describeWithPostgres("PostgresTransactionRepository", () => {
         staleBefore: new Date(baseTime.getTime() - 29_000),
       }),
     ).toEqual({ kind: "completed_replay", transaction: result });
+  });
+
+  test("completes PostgreSQL state after deterministic transient failures", async () => {
+    const { provider, keys } = resilientFakeProvider([503, 503, "success"]);
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000050" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    const result = await useCase.execute(
+      { amount: 1099, currency: "BRL", description: "Transient recovery" },
+      "resilience-success-key",
+    );
+
+    expect(result.created).toBeTrue();
+    expect(keys).toEqual([
+      "resilience-success-key",
+      "resilience-success-key",
+      "resilience-success-key",
+    ]);
+    expect(await repository.count()).toBe(1);
+    expect(await repository.findById(result.transaction.id)).toEqual(
+      result.transaction,
+    );
+  });
+
+  test("keeps processing after deterministic ambiguous retries are exhausted", async () => {
+    const { provider, keys } = resilientFakeProvider([503, 503, 503]);
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000051" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Ambiguous failure" },
+        "resilience-ambiguous-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderServerError);
+    const rows = await sql<{ status: string }[]>`
+      SELECT status FROM idempotency_operations
+      WHERE idempotency_key = 'resilience-ambiguous-key'
+    `;
+
+    expect(keys).toEqual([
+      "resilience-ambiguous-key",
+      "resilience-ambiguous-key",
+      "resilience-ambiguous-key",
+    ]);
+    expect(await repository.count()).toBe(0);
+    expect(rows[0]?.status).toBe("processing");
+  });
+
+  test("aborts and retries hanging HTTP attempts while keeping PostgreSQL processing", async () => {
+    const keys: string[] = [];
+    const fetchRequest: FetchRequest = (input, init) => {
+      const request = new Request(input, init);
+      keys.push(request.headers.get("Idempotency-Key") ?? "");
+      return new Promise((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      });
+    };
+    const immediateTimeout: TimeoutScheduler = {
+      schedule: (callback) => {
+        queueMicrotask(callback);
+        return { cancel: () => undefined };
+      },
+    };
+    const resilientProvider = new ResilientPaymentProvider(
+      new HttpPaymentProvider(
+        "http://provider/transactions",
+        3_000,
+        fetchRequest,
+        immediateTimeout,
+      ),
+      new RetryPolicy({
+        maxAttempts: 3,
+        attemptTimeoutMs: 3_000,
+        baseDelayMs: 500,
+        maxDelayMs: 2_000,
+        jitterRatio: 0.2,
+      }),
+      new CircuitBreaker(
+        { failureThreshold: 10, openDurationMs: 1_000 },
+        { now: () => baseTime },
+      ),
+      { sleep: async () => undefined },
+      { next: () => 0 },
+    );
+    const useCase = new CreateTransaction(
+      repository,
+      resilientProvider,
+      { generate: () => "00000000-0000-4000-8000-000000000054" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Provider timeout" },
+        "resilience-timeout-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderTimeoutError);
+    const rows = await sql<{ status: string }[]>`
+      SELECT status FROM idempotency_operations
+      WHERE idempotency_key = 'resilience-timeout-key'
+    `;
+
+    expect(keys).toEqual([
+      "resilience-timeout-key",
+      "resilience-timeout-key",
+      "resilience-timeout-key",
+    ]);
+    expect(await repository.count()).toBe(0);
+    expect(rows[0]?.status).toBe("processing");
+  });
+
+  test("releases PostgreSQL claim after a deterministic definitive rejection", async () => {
+    const { provider, keys } = resilientFakeProvider([400]);
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000052" },
+      { now: () => baseTime },
+      30_000,
+    );
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Rejected request" },
+        "resilience-rejected-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderRejectedError);
+    const rows = await sql<{ total: number | string }[]>`
+      SELECT COUNT(*) AS total FROM idempotency_operations
+      WHERE idempotency_key = 'resilience-rejected-key'
+    `;
+
+    expect(keys).toEqual(["resilience-rejected-key"]);
+    expect(await repository.count()).toBe(0);
+    expect(Number(rows[0]?.total)).toBe(0);
+  });
+
+  test("releases a new claim when an open breaker blocks before any external call", async () => {
+    const { provider, breaker, keys } = resilientFakeProvider(
+      [503, 503, 503],
+      1,
+    );
+    const useCase = new CreateTransaction(
+      repository,
+      provider,
+      { generate: () => "00000000-0000-4000-8000-000000000053" },
+      { now: () => baseTime },
+      30_000,
+    );
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Open breaker seed" },
+        "breaker-seed-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderServerError);
+    expect(breaker.state()).toBe("open");
+
+    await expect(
+      useCase.execute(
+        { amount: 1099, currency: "BRL", description: "Blocked before call" },
+        "breaker-blocked-key",
+      ),
+    ).rejects.toBeInstanceOf(ProviderCircuitOpenError);
+    const blockedRows = await sql<{ total: number | string }[]>`
+      SELECT COUNT(*) AS total FROM idempotency_operations
+      WHERE idempotency_key = 'breaker-blocked-key'
+    `;
+
+    expect(keys).toHaveLength(3);
+    expect(Number(blockedRows[0]?.total)).toBe(0);
   });
 });
