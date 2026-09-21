@@ -1,6 +1,6 @@
 # resilient-transaction-api
 
-API de processamento de transações construída com Bun, TypeScript, PostgreSQL e Clean Architecture. O projeto demonstra dinheiro em minor units, integração externa resiliente e idempotência com garantia de concorrência baseada em constraints e operações atômicas do banco.
+API de processamento de transações construída com Bun, TypeScript, PostgreSQL, Redis e Clean Architecture. O projeto demonstra dinheiro em minor units, integração externa resiliente, cache-aside, rate limiting distribuído e idempotência com garantia de concorrência baseada em constraints e operações atômicas do banco.
 
 Este é um case de engenharia. Não é um sistema financeiro real e não implementa ledger, settlement, chargeback, antifraude ou PCI DSS.
 
@@ -15,9 +15,10 @@ Application use cases
    ↓
 Ports
    ↓
-Infrastructure
+   Infrastructure
    ├── PostgreSQL repository
-   ├── In-memory rate limiter
+   ├── Redis transaction cache
+   ├── Redis rate limiter
    └── Provider resilience decorator
             ├── bounded retry policy
             ├── local circuit breaker
@@ -26,7 +27,7 @@ Infrastructure
        Fake provider
 ```
 
-PostgreSQL é a source of truth para transações e idempotência. O adapter in-memory permanece apenas como test double. Domain e Application não conhecem Bun, HTTP, Zod ou SQL.
+PostgreSQL é a source of truth para transações e idempotência. Redis tem duas responsabilidades separadas: cache descartável e contador distribuído de rate limiting. O adapter in-memory permanece apenas como test double. Domain e Application não conhecem Bun, HTTP, Zod, SQL ou o cliente Redis.
 
 O uso do cliente PostgreSQL nativo está registrado em [ADR 0001](docs/adr/0001-use-bun-sql-for-postgresql.md). `Bun.SQL` atende pool, parâmetros, transações e migrations sem uma dependência adicional.
 
@@ -128,7 +129,55 @@ Erros preservam o envelope:
 
 SQL, connection strings, erros brutos e stack traces não são enviados ao cliente.
 
-`X-Client-Id` ainda identifica somente o bucket do rate limiter local. Ele não é autenticação nem identidade confiável.
+`X-Client-Id` identifica somente o bucket distribuído do rate limiter. Ele é controlado pelo cliente e não representa autenticação ou identidade confiável.
+
+## Redis: responsabilidades e limites
+
+O projeto usa `Bun.RedisClient`, sem biblioteca externa. A escolha e os trade-offs estão em [ADR 0003](docs/adr/0003-use-redis-for-cache-and-rate-limiting.md).
+
+Os namespaces não se misturam:
+
+```text
+rate-limit:v1:<encoded-client-id>
+transaction-cache:v1:<transaction-id>
+```
+
+Redis nunca armazena claim idempotente, `IdempotencyOperation`, estado do circuit breaker ou o resultado definitivo como source of truth. Perder todo o conteúdo Redis não remove nenhuma `Transaction` persistida.
+
+### Rate limiting distribuído
+
+O algoritmo é fixed window iniciada no primeiro request. Um script Lua executa `INCR`, aplica `PEXPIRE` na criação e lê `PTTL` como uma única operação atômica. Isso elimina a janela de falha entre incremento e expiração. O default permite cinco requests por 60 segundos.
+
+Acima do limite, a API retorna HTTP `429`, código `RATE_LIMIT_EXCEEDED` e `Retry-After` derivado do `PTTL` real da key.
+
+A política é fail-open. Se Redis estiver lento, indisponível ou retornar algo inválido, a request prossegue sem rate limiting e um aviso operacional JSON, sem erro bruto ou identifiers, é emitido. Para este case, uma degradação temporária da proteção contra abuso é preferível a derrubar PostgreSQL e provider junto com uma dependência operacional. Autenticação será tratada separadamente; `X-Client-Id` continua não confiável.
+
+### Cache-aside
+
+Somente `GET /transactions/:id` usa cache:
+
+```text
+Redis GET
+├── HIT válido → Transaction
+└── MISS/erro → PostgreSQL
+                  └── encontrou → Redis SET EX → Transaction
+```
+
+O conteúdo é JSON estrito com `id`, minor units, currency, description, `providerTransactionId`, status final e `createdAt` ISO 8601. Toda leitura é validada com Zod e `createdAt` volta a ser `Date`. JSON corrompido, schema inválido ou ID divergente é removido quando possível e tratado como miss operacional; PostgreSQL atende a request.
+
+O TTL default é uma hora. `Transaction` é imutável no escopo atual, então esse TTL reduz reads repetidos sem exigir invalidation ativa e limita a vida de uma entrada caso o modelo ganhe mutabilidade no futuro. `SET ... EX` grava valor e TTL atomicamente.
+
+POST não popula o cache. O primeiro GET faz isso depois de ler a transação já commitada no PostgreSQL. Também não há cache de listagem, paginação, count, 404, claims ou estado `processing`. Não há negative caching, distributed lock ou proteção contra stampede; misses simultâneos podem consultar PostgreSQL.
+
+Falha de cache nunca muda o resultado de negócio. Cache read ou write com erro cai para PostgreSQL ou preserva a resposta já encontrada. O timeout default por operação Redis é 250 ms. O timeout limita a espera do request, mas não cancela um comando que já tenha chegado ao Redis.
+
+### Semântica das dependências
+
+- PostgreSQL indisponível: operações persistentes e reads em cache miss não podem prosseguir normalmente;
+- Redis indisponível: idempotência permanece correta, GET individual cai para PostgreSQL e rate limiting fica temporariamente fail-open;
+- provider indisponível: permanecem as regras bounded de retry, ambiguidade e circuit breaker da Fase 3.
+
+Os contadores `cache_hit_total`, `cache_miss_total`, `cache_error_total` e `rate_limit_rejected_total` não foram adicionados porque ainda não existe uma infraestrutura de métricas. Eles serão conectados na fase de observabilidade sem criar um subsystem provisório nesta fase.
 
 ## Resiliência do provider
 
@@ -179,6 +228,12 @@ O fake provider mantém sua própria idempotência em memória. Nos cenários `t
 | `PROVIDER_EXECUTION_OVERHEAD_MS` | `2000` |
 | `IDEMPOTENCY_PROCESSING_TIMEOUT_MS` | `30000` |
 | `IDEMPOTENCY_MINIMUM_STALE_MARGIN_MS` | `3000` |
+| `REDIS_COMMAND_TIMEOUT_MS` | `250` |
+| `TRANSACTION_CACHE_TTL_SECONDS` | `3600` |
+| `TRANSACTION_CACHE_KEY_PREFIX` | `transaction-cache:v1` |
+| `RATE_LIMIT_MAX_REQUESTS` | `5` |
+| `RATE_LIMIT_WINDOW_MS` | `60000` |
+| `RATE_LIMIT_KEY_PREFIX` | `rate-limit:v1` |
 
 ## Como rodar
 
@@ -186,11 +241,13 @@ Pré-requisitos:
 
 - Bun;
 - PostgreSQL acessível;
+- Redis 7.2+ acessível;
 - banco criado para a aplicação.
 
 ```bash
 bun install
 export DATABASE_URL='postgres://user:password@localhost:5432/resilient_transactions'
+export REDIS_URL='redis://localhost:6379'
 bun run migrate
 ```
 
@@ -226,24 +283,26 @@ Testes unitários não precisam de banco:
 bun test tests/application tests/http tests/infrastructure/in-memory-transaction-repository.test.ts
 ```
 
-Os testes de integração exigem um banco PostgreSQL descartável. Eles removem e recriam as tabelas do schema `public`; nunca aponte `TEST_DATABASE_URL` para um banco compartilhado ou com dados importantes.
+Os testes de integração exigem PostgreSQL e Redis descartáveis. Eles removem e recriam as tabelas do schema `public` e executam `FLUSHDB` no Redis; nunca use ambientes compartilhados ou com dados importantes.
 
 ```bash
 export TEST_DATABASE_URL='postgres://user:password@localhost:5432/resilient_transaction_test'
+export TEST_REDIS_URL='redis://localhost:6379/15'
 bun run test:integration
-TEST_DATABASE_URL="$TEST_DATABASE_URL" bun test
+TEST_DATABASE_URL="$TEST_DATABASE_URL" TEST_REDIS_URL="$TEST_REDIS_URL" bun test
 bun run typecheck
 ```
 
-A suíte de integração aplica migrations a partir de vazio, testa constraints, 20 claims concorrentes, uma única chamada ao provider, replay após nova instância do repository, conflitos de fingerprint, rollback, reclaim, ordenação, paginação e os fluxos completos de retry/success, timeout, rejeição, esgotamento ambíguo e breaker aberto.
+A suíte de integração aplica migrations a partir de vazio, testa constraints, idempotência concorrente, provider resilience, rate limit atômico concorrente, compartilhamento entre adapters, TTL, cache inválido, Redis indisponível e o fluxo HTTP completo `POST → cache MISS → cache HIT`.
 
 ## Limitações atuais
 
 - a correção do side effect externo depende da idempotência oferecida pelo provider;
 - o reclaim usa lease por tempo e pressupõe relógios razoavelmente sincronizados;
-- rate limiting ainda é local ao processo;
 - não há autenticação;
-- não há Redis/cache;
+- rate limiting fica fail-open durante indisponibilidade do Redis;
+- misses concorrentes podem consultar PostgreSQL simultaneamente;
+- o cliente Redis nativo não suporta Redis Cluster ou Sentinel;
 - o circuit breaker é local por réplica e perde estado no restart;
 - clocks pausados, clock skew extremo ou stalls do runtime ainda podem ultrapassar a margem do stale timeout;
 - não há limite explícito de bytes do body;
