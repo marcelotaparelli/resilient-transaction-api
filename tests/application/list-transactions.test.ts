@@ -7,15 +7,17 @@ class RepositorySpy implements TransactionRepository {
   offset: number | null = null;
   limit: number | null = null;
 
+  async claimIdempotencyOperation() {
+    return { kind: "new_claim" } as const;
+  }
+
+  async completeIdempotencyOperation(): Promise<void> {}
+
+  async releaseIdempotencyOperation(): Promise<void> {}
+
   async findById(): Promise<Transaction | null> {
     return null;
   }
-
-  async findByIdempotencyKey(): Promise<Transaction | null> {
-    return null;
-  }
-
-  async save(): Promise<void> {}
 
   async list(offset: number, limit: number): Promise<Transaction[]> {
     this.offset = offset;

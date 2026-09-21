@@ -1,4 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { IdempotencyConflictError } from "../../src/application/errors/idempotency-conflict-error";
+import { IdempotencyInProgressError } from "../../src/application/errors/idempotency-in-progress-error";
+import { ProviderRejectedError } from "../../src/application/errors/provider-errors";
+import type {
+  ClaimIdempotencyOperation,
+  CompleteIdempotencyOperation,
+  IdempotencyClaimResult,
+  ReleaseIdempotencyOperation,
+} from "../../src/application/models/idempotency-operation";
 import type {
   PaymentProvider,
   ProviderResult,
@@ -12,8 +21,8 @@ import type {
 
 const input: TransactionInput = {
   amount: 1099,
-  currency: "BRL",
-  description: "Order 123",
+  currency: "brl",
+  description: "  Order 123  ",
 };
 
 const providerResult: ProviderResult = {
@@ -24,36 +33,49 @@ const providerResult: ProviderResult = {
 const createdAt = new Date("2026-01-02T03:04:05.000Z");
 const approvedTransaction: Transaction = {
   id: "00000000-0000-4000-8000-000000000001",
-  ...input,
+  amount: 1099,
+  currency: "BRL",
+  description: "Order 123",
   providerTransactionId: providerResult.providerTransactionId,
   status: "approved",
   createdAt,
 };
 
 class RepositoryStub implements TransactionRepository {
-  stored: Transaction | null = null;
+  claimResult: IdempotencyClaimResult = { kind: "new_claim" };
+  claimRequest: ClaimIdempotencyOperation | null = null;
+  completed: CompleteIdempotencyOperation | null = null;
+  released: ReleaseIdempotencyOperation | null = null;
 
-  async findById(transactionId: string): Promise<Transaction | null> {
-    return this.stored?.id === transactionId ? this.stored : null;
+  async claimIdempotencyOperation(
+    operation: ClaimIdempotencyOperation,
+  ): Promise<IdempotencyClaimResult> {
+    this.claimRequest = operation;
+    return this.claimResult;
   }
 
-  async findByIdempotencyKey(): Promise<Transaction | null> {
-    return this.stored;
-  }
-
-  async save(
-    _idempotencyKey: string,
-    transaction: Transaction,
+  async completeIdempotencyOperation(
+    operation: CompleteIdempotencyOperation,
   ): Promise<void> {
-    this.stored = transaction;
+    this.completed = operation;
+  }
+
+  async releaseIdempotencyOperation(
+    operation: ReleaseIdempotencyOperation,
+  ): Promise<void> {
+    this.released = operation;
+  }
+
+  async findById(): Promise<Transaction | null> {
+    return null;
   }
 
   async list(): Promise<Transaction[]> {
-    return this.stored === null ? [] : [this.stored];
+    return [];
   }
 
   async count(): Promise<number> {
-    return this.stored === null ? 0 : 1;
+    return 0;
   }
 }
 
@@ -80,11 +102,12 @@ function createUseCase(
     provider,
     { generate: () => approvedTransaction.id },
     { now: () => createdAt },
+    30_000,
   );
 }
 
 describe("CreateTransaction", () => {
-  test("successful creation calls the provider once and builds the internal transaction", async () => {
+  test("a new claim calls the provider once and completes the operation", async () => {
     const repository = new RepositoryStub();
     const provider = new ProviderStub();
     const useCase = createUseCase(repository, provider);
@@ -93,12 +116,28 @@ describe("CreateTransaction", () => {
 
     expect(result).toEqual({ transaction: approvedTransaction, created: true });
     expect(provider.calls).toBe(1);
-    expect(repository.stored).toEqual(approvedTransaction);
+    expect(repository.claimRequest).toMatchObject({
+      idempotencyKey: "idempotency-key",
+      requestFingerprint:
+        "a2e97cad2002b1babda12974e1821c08b3e416573a9bdcb33b74b6b4852ae10f",
+      claimedAt: createdAt,
+      staleBefore: new Date("2026-01-02T03:03:35.000Z"),
+    });
+    expect(repository.completed).toEqual({
+      idempotencyKey: "idempotency-key",
+      requestFingerprint:
+        "a2e97cad2002b1babda12974e1821c08b3e416573a9bdcb33b74b6b4852ae10f",
+      transaction: approvedTransaction,
+      completedAt: createdAt,
+    });
   });
 
-  test("sequential replay returns the stored result without calling the provider", async () => {
+  test("completed replay returns the stored transaction without calling the provider", async () => {
     const repository = new RepositoryStub();
-    repository.stored = approvedTransaction;
+    repository.claimResult = {
+      kind: "completed_replay",
+      transaction: approvedTransaction,
+    };
     const provider = new ProviderStub();
     const useCase = createUseCase(repository, provider);
 
@@ -106,17 +145,60 @@ describe("CreateTransaction", () => {
 
     expect(result).toEqual({ transaction: approvedTransaction, created: false });
     expect(provider.calls).toBe(0);
+    expect(repository.completed).toBeNull();
   });
 
-  test("provider failure does not save an approved transaction", async () => {
+  test("fingerprint conflict fails without calling the provider", async () => {
     const repository = new RepositoryStub();
+    repository.claimResult = { kind: "fingerprint_conflict" };
     const provider = new ProviderStub();
-    provider.error = new Error("provider failed");
     const useCase = createUseCase(repository, provider);
 
     await expect(
       useCase.execute(input, "idempotency-key"),
-    ).rejects.toThrow("provider failed");
-    expect(repository.stored).toBeNull();
+    ).rejects.toBeInstanceOf(IdempotencyConflictError);
+    expect(provider.calls).toBe(0);
+  });
+
+  test("an active processing operation fails immediately without polling", async () => {
+    const repository = new RepositoryStub();
+    repository.claimResult = { kind: "processing" };
+    const provider = new ProviderStub();
+    const useCase = createUseCase(repository, provider);
+
+    await expect(
+      useCase.execute(input, "idempotency-key"),
+    ).rejects.toBeInstanceOf(IdempotencyInProgressError);
+    expect(provider.calls).toBe(0);
+  });
+
+  test("definitive provider rejection releases the claim for a safe retry", async () => {
+    const repository = new RepositoryStub();
+    const provider = new ProviderStub();
+    provider.error = new ProviderRejectedError();
+    const useCase = createUseCase(repository, provider);
+
+    await expect(
+      useCase.execute(input, "idempotency-key"),
+    ).rejects.toBeInstanceOf(ProviderRejectedError);
+    expect(repository.completed).toBeNull();
+    expect(repository.released).toEqual({
+      idempotencyKey: "idempotency-key",
+      requestFingerprint:
+        "a2e97cad2002b1babda12974e1821c08b3e416573a9bdcb33b74b6b4852ae10f",
+    });
+  });
+
+  test("ambiguous provider failure keeps the operation processing", async () => {
+    const repository = new RepositoryStub();
+    const provider = new ProviderStub();
+    provider.error = new Error("outcome unknown");
+    const useCase = createUseCase(repository, provider);
+
+    await expect(
+      useCase.execute(input, "idempotency-key"),
+    ).rejects.toThrow("outcome unknown");
+    expect(repository.completed).toBeNull();
+    expect(repository.released).toBeNull();
   });
 });

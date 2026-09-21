@@ -18,9 +18,10 @@ function repositoryReturning(
   result: Transaction | null,
 ): TransactionRepository {
   return {
+    claimIdempotencyOperation: async () => ({ kind: "new_claim" }),
+    completeIdempotencyOperation: async () => {},
+    releaseIdempotencyOperation: async () => {},
     findById: async () => result,
-    findByIdempotencyKey: async () => null,
-    save: async () => {},
     list: async () => [],
     count: async () => 0,
   };

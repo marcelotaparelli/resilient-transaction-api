@@ -1,16 +1,25 @@
 import type { Transaction } from "../../domain/transaction";
+import type {
+  ClaimIdempotencyOperation,
+  CompleteIdempotencyOperation,
+  IdempotencyClaimResult,
+  ReleaseIdempotencyOperation,
+} from "../models/idempotency-operation";
 
 export interface TransactionRepository {
-  findById(transactionId: string): Promise<Transaction | null>;
+  claimIdempotencyOperation(
+    operation: ClaimIdempotencyOperation,
+  ): Promise<IdempotencyClaimResult>;
 
-  findByIdempotencyKey(
-    idempotencyKey: string,
-  ): Promise<Transaction | null>;
-
-  save(
-    idempotencyKey: string,
-    transaction: Transaction,
+  completeIdempotencyOperation(
+    operation: CompleteIdempotencyOperation,
   ): Promise<void>;
+
+  releaseIdempotencyOperation(
+    operation: ReleaseIdempotencyOperation,
+  ): Promise<void>;
+
+  findById(transactionId: string): Promise<Transaction | null>;
 
   list(offset: number, limit: number): Promise<Transaction[]>;
 
