@@ -1,8 +1,10 @@
 # resilient-transaction-api
 
-API de processamento de transações construída com Bun, TypeScript e Clean Architecture. A versão atual é a base in-memory do case: valida contratos em runtime, integra com um provider HTTP e mantém o núcleo independente de detalhes de transporte e persistência.
+API de processamento de transações construída com Bun, TypeScript, PostgreSQL e Clean Architecture. O projeto demonstra dinheiro em minor units, integração externa resiliente e idempotência com garantia de concorrência baseada em constraints e operações atômicas do banco.
 
-## Arquitetura
+Este é um case de engenharia. Não é um sistema financeiro real e não implementa ledger, settlement, chargeback, antifraude ou PCI DSS.
+
+## Arquitetura atual
 
 ```text
 Client
@@ -14,86 +16,135 @@ Application use cases
 Ports
    ↓
 Infrastructure
-   ├── In-memory repository
+   ├── PostgreSQL repository
    ├── In-memory rate limiter
    └── HTTP payment provider
             ↓
        Fake provider
 ```
 
-`domain` contém o modelo da transação. `application` contém casos de uso, erros e ports sem conhecer Bun, HTTP, Zod ou adapters. `infrastructure` implementa os ports. `http` valida e traduz requests, responses e erros. `main.ts` instancia e conecta as implementações.
+PostgreSQL é a source of truth para transações e idempotência. O adapter in-memory permanece apenas como test double. Domain e Application não conhecem Bun, HTTP, Zod ou SQL.
 
-O handler HTTP é criado separadamente do listener. Isso permite testar requests e responses diretamente, sem abrir sockets; `Bun.serve` permanece restrito a `startServer`.
+O uso do cliente PostgreSQL nativo está registrado em [ADR 0001](docs/adr/0001-use-bun-sql-for-postgresql.md). `Bun.SQL` atende pool, parâmetros, transações e migrations sem uma dependência adicional.
 
-## Dinheiro e modelo da transação
+## Dinheiro e Transaction
 
-`amount` é um inteiro em minor units. Por exemplo, `1099 BRL` representa R$ 10,99. A API rejeita zero, valores negativos, frações e números acima do limite seguro de inteiros do JavaScript. Esta fase não usa `Decimal` ou bibliotecas de precisão porque não realiza cálculos monetários fracionários.
+`amount` é um inteiro em minor units: `1099 BRL` representa R$ 10,99. A API rejeita floats, zero, valores negativos e números fora do intervalo seguro do JavaScript.
 
-Uma transação aprovada contém:
+`Transaction` representa somente o resultado de negócio aprovado:
 
-- `id`: identidade interna gerada pela API;
-- `amount`: valor inteiro em minor units;
-- `currency`: código de três letras normalizado para maiúsculas;
-- `description`: texto entre 1 e 200 caracteres;
-- `status`: estado interno final `approved`;
-- `providerTransactionId`: identidade retornada pelo provider;
+- `id`: UUID interno;
+- `amount`: minor units;
+- `currency`: três letras normalizadas;
+- `description`: 1 a 200 caracteres;
+- `providerTransactionId`: identidade externa;
+- `status`: `approved`;
 - `createdAt`: instante de criação.
 
-O provider retorna apenas seu próprio resultado (`providerTransactionId` e `decision`). Ele não define a estrutura da transação interna.
+Estados operacionais não foram adicionados à `Transaction`.
 
-## Endpoints
+## Idempotência concorrente
+
+O estado operacional fica em `idempotency_operations`, separado de `transactions`, com dois estados mínimos:
+
+- `processing`: a chave foi adquirida e ainda não existe resultado local final;
+- `completed`: a transação foi persistida e vinculada à operação.
+
+O fingerprint é SHA-256 da representação JSON canônica de `amount`, `currency` normalizada e `description` normalizada. IDs, timestamps e headers não participam do hash.
+
+O claim começa com:
+
+```sql
+INSERT ...
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING idempotency_key
+```
+
+A primary key de `idempotency_key` é a garantia atômica. Não existe `SELECT → INSERT`, mutex em memória ou distributed lock.
+
+Resultados possíveis:
+
+- `new_claim`: esta execução pode chamar o provider;
+- `completed_replay`: devolve a mesma `Transaction` persistida;
+- `fingerprint_conflict`: mesma chave com payload lógico diferente;
+- `processing`: outra execução está ativa.
+
+`processing` retorna imediatamente HTTP `409`, código `IDEMPOTENCY_OPERATION_IN_PROGRESS` e `Retry-After: 1`. Não existe espera ou polling infinito no request.
+
+O timeout de processamento é configurado por `IDEMPOTENCY_PROCESSING_TIMEOUT_MS`, default 30 segundos. Após essa janela, uma operação ainda `processing` pode ser reclamada atomicamente. O valor deve ser maior que a duração máxima normal da política do provider. O reclaim permite recuperar crash ou falha entre aprovação externa e persistência.
+
+## Limites da garantia
+
+API idempotency não equivale a exactly-once external side effects.
+
+Se o provider processar e a resposta for perdida, timeout não prova que o pagamento falhou. Por isso erros ambíguos deixam a operação em `processing`. Um retry após a janela reutiliza a mesma `Idempotency-Key` no provider.
+
+Se o provider aprovar e PostgreSQL falhar, a transação e a conclusão são protegidas por uma transação curta: ou ambas persistem, ou ambas sofrem rollback. A operação continua `processing` e pode ser reclamada. Na nova tentativa, o provider precisa honrar a mesma chave e retornar seu resultado anterior.
+
+Durante um reclaim por timeout, a execução anterior pode ainda estar viva. Isso pode gerar mais de uma chamada externa com a mesma key. A constraint garante somente uma `Transaction` interna final; a deduplicação do side effect externo depende do contrato idempotente do provider. Não há claim de exactly-once.
+
+Rejeição HTTP definitiva do provider libera a claim para um retry seguro. Timeout, falha de rede, `5xx` e resposta externa inválida são tratados como resultados potencialmente ambíguos e mantêm `processing`.
+
+## Persistência e ordenação
+
+Migrations ficam em `migrations/` e nunca são aplicadas automaticamente no startup. A conclusão executa em uma transação PostgreSQL curta:
+
+```text
+INSERT Transaction
+→ UPDATE operation para completed
+→ COMMIT
+```
+
+A chamada HTTP ao provider ocorre depois do commit da claim e antes da transação de conclusão. Nenhum lock ou transaction PostgreSQL fica aberto durante rede externa.
+
+Listagens usam:
+
+```sql
+ORDER BY created_at DESC, id DESC
+```
+
+Há um índice correspondente. A paginação continua baseada em `page` e `limit`, com limite máximo de 100.
+
+## HTTP
 
 - `GET /health`
 - `POST /transactions`
 - `GET /transactions/:id`
 - `GET /transactions?page=1&limit=20`
 
-As rotas de transações exigem `X-Client-Id`. Nesta fase esse header identifica o bucket do rate limiter, mas não é uma identidade confiável nem autenticação. Autenticação por credencial de serviço será adicionada na fase de segurança.
-
-Erros usam um envelope estável:
+Erros preservam o envelope:
 
 ```json
 {
   "error": {
-    "code": "TRANSACTION_NOT_FOUND",
-    "message": "Transaction not found"
+    "code": "IDEMPOTENCY_KEY_CONFLICT",
+    "message": "Idempotency key was already used for a different transaction"
   }
 }
 ```
 
-O objeto `error` poderá receber `requestId` posteriormente sem mudar sua estrutura principal. Mensagens internas e stack traces não são enviados ao cliente.
+SQL, connection strings, erros brutos e stack traces não são enviados ao cliente.
 
-## Idempotência
+`X-Client-Id` ainda identifica somente o bucket do rate limiter local. Ele não é autenticação nem identidade confiável.
 
-A API encaminha a mesma `Idempotency-Key` ao provider e consulta o repository antes de processar uma nova transação.
+## Provider atual
 
-Sequential replay is supported in the in-memory adapter. Atomic idempotency under concurrency is intentionally deferred to the PostgreSQL implementation.
+Cada tentativa tem timeout de 3 segundos com `AbortController`. Timeout, falha de rede e `5xx` recebem até três tentativas, com esperas de 500 ms e 1.000 ms. A mesma `Idempotency-Key` é propagada em todas as tentativas.
 
-Esta versão não oferece `requestFingerprint`, conflito para payload diferente, reserva atômica ou garantia de processamento concorrente. A próxima fase implementará esses invariantes com PostgreSQL, `UNIQUE`, transações e testes de integração reais. API idempotency não será descrita como exactly-once para side effects externos.
-
-## Provider e rate limiting atuais
-
-Cada tentativa contra o provider possui timeout de 3 segundos com `AbortController`. Timeout, falha de rede e respostas `5xx` recebem até três tentativas, com esperas de 500 ms e 1.000 ms. Rejeições e respostas que não cumprem o schema não recebem retry.
-
-O rate limiter fixed-window permite cinco requisições por `X-Client-Id` a cada 60 segundos. Tanto o repository quanto o rate limiter são locais ao processo e servem somente para desenvolvimento e testes nesta fase.
-
-## Validação
-
-- `amount`: inteiro positivo e seguro;
-- `currency`: exatamente três letras;
-- `description`: 1 a 200 caracteres;
-- `Idempotency-Key`: 1 a 128 caracteres;
-- `X-Client-Id`: 1 a 128 caracteres;
-- `page`: inteiro positivo, máximo 1.000.000, default 1;
-- `limit`: inteiro positivo, máximo 100, default 20;
-- bodies e queries rejeitam campos inesperados.
-
-Um limite explícito de bytes para o request body permanece para a fase de HTTP hardening.
+Jitter, HTTP `429`, circuit breaker e fault injection adicional pertencem à Fase 3 e não estão implementados ainda.
 
 ## Como rodar
 
+Pré-requisitos:
+
+- Bun;
+- PostgreSQL acessível;
+- banco criado para a aplicação.
+
 ```bash
 bun install
+export DATABASE_URL='postgres://user:password@localhost:5432/resilient_transactions'
+bun run migrate
 ```
 
 Inicie o fake provider:
@@ -102,23 +153,15 @@ Inicie o fake provider:
 bun run provider
 ```
 
-Em outro terminal, inicie a API:
+Em outro terminal:
 
 ```bash
 bun run dev
 ```
 
-A API usa `http://localhost:4002` e o provider usa `http://localhost:4003`.
+A API usa `http://localhost:4002`; o provider usa `http://localhost:4003`.
 
-## Exemplos
-
-Health check:
-
-```bash
-curl -i http://localhost:4002/health
-```
-
-Criar uma transação:
+## Exemplo
 
 ```bash
 curl -i -X POST http://localhost:4002/transactions \
@@ -128,38 +171,33 @@ curl -i -X POST http://localhost:4002/transactions \
   -d '{"amount":1099,"currency":"BRL","description":"Order 123"}'
 ```
 
-Consultar pelo `id` interno retornado na criação:
+## Testes
+
+Testes unitários não precisam de banco:
 
 ```bash
-curl -i http://localhost:4002/transactions/TRANSACTION_ID \
-  -H 'X-Client-Id: client-123'
+bun test tests/application tests/http tests/infrastructure/in-memory-transaction-repository.test.ts
 ```
 
-Listar transações:
+Os testes de integração exigem um banco PostgreSQL descartável. Eles removem e recriam as tabelas do schema `public`; nunca aponte `TEST_DATABASE_URL` para um banco compartilhado ou com dados importantes.
 
 ```bash
-curl -i 'http://localhost:4002/transactions?page=1&limit=20' \
-  -H 'X-Client-Id: client-123'
-```
-
-## Testes e typecheck
-
-```bash
-bun test
+export TEST_DATABASE_URL='postgres://user:password@localhost:5432/resilient_transaction_test'
+bun run test:integration
+TEST_DATABASE_URL="$TEST_DATABASE_URL" bun test
 bun run typecheck
 ```
 
-Os testes cobrem casos de uso, replay sequencial, falha do provider, repository in-memory, ordenação, paginação, schemas, consulta por ID, envelope de erro e handler HTTP sem socket.
+A suíte de integração aplica migrations a partir de vazio, testa constraints, 20 claims concorrentes, uma única chamada ao provider, replay após nova instância do repository, conflitos de fingerprint, rollback, reclaim, ordenação e paginação.
 
 ## Limitações atuais
 
-- dados e rate limit são perdidos em reinícios;
-- réplicas não compartilham estado;
-- concorrência idempotente ainda não possui garantia atômica;
-- mesma chave com payload diferente ainda não gera conflito;
+- a correção do side effect externo depende da idempotência oferecida pelo provider;
+- o reclaim usa lease por tempo e pressupõe relógios razoavelmente sincronizados;
+- rate limiting ainda é local ao processo;
 - não há autenticação;
-- não há cache, circuit breaker, observabilidade ou graceful shutdown;
+- não há Redis/cache;
+- não há jitter ou circuit breaker;
 - não há limite explícito de bytes do body;
-- não há PostgreSQL, Redis, Docker ou infraestrutura AWS.
-
-A próxima fase substitui a persistência real por PostgreSQL com migrations, constraints, fingerprint determinístico e idempotência concorrente. O repository in-memory continuará disponível para testes unitários.
+- não há observabilidade avançada ou graceful shutdown;
+- não há Docker ou infraestrutura AWS.
