@@ -20,9 +20,14 @@ import type {
   PaymentProvider,
   ProviderResult,
 } from "../../src/application/ports/payment-provider";
+import type { TransactionRepository } from "../../src/application/ports/transaction-repository";
 import { CreateTransaction } from "../../src/application/use-cases/create-transaction";
+import { GetTransaction } from "../../src/application/use-cases/get-transaction";
+import { ListTransactions } from "../../src/application/use-cases/list-transactions";
 import type { Transaction } from "../../src/domain/transaction";
 import { createFakeProviderHandler } from "../../src/dev/fake-provider";
+import { createHttpHandler } from "../../src/http/server";
+import { RedisTransactionCache } from "../../src/infrastructure/cache/redis-transaction-cache";
 import { runMigrations } from "../../src/infrastructure/database/migrate";
 import { CircuitBreaker } from "../../src/infrastructure/providers/circuit-breaker";
 import {
@@ -32,11 +37,19 @@ import {
 } from "../../src/infrastructure/providers/http-payment-provider";
 import { ResilientPaymentProvider } from "../../src/infrastructure/providers/resilient-payment-provider";
 import { RetryPolicy } from "../../src/infrastructure/providers/retry-policy";
+import { RedisRateLimiter } from "../../src/infrastructure/rate-limit/redis-rate-limiter";
+import {
+  createBunRedisClient,
+  RedisCommandExecutor,
+} from "../../src/infrastructure/redis/redis-client";
+import { transactionCacheKey } from "../../src/infrastructure/redis/redis-keys";
 import { PostgresTransactionRepository } from "../../src/infrastructure/repositories/postgres-transaction-repository";
 
 const databaseUrl = Bun.env.TEST_DATABASE_URL;
+const redisUrl = Bun.env.TEST_REDIS_URL;
 const describeWithPostgres =
   databaseUrl === undefined ? describe.skip : describe;
+const testWithRedis = redisUrl === undefined ? test.skip : test;
 const fingerprint = "a".repeat(64);
 const baseTime = new Date("2026-01-01T00:00:00.000Z");
 
@@ -716,5 +729,92 @@ describeWithPostgres("PostgresTransactionRepository", () => {
 
     expect(keys).toHaveLength(3);
     expect(Number(blockedRows[0]?.total)).toBe(0);
+  });
+
+  testWithRedis("serves POST then cache MISS and HIT through the HTTP handler", async () => {
+    const redisClient = createBunRedisClient(redisUrl as string, 250);
+    const redis = new RedisCommandExecutor(redisClient, 250);
+    const cachePrefix = "transaction-cache:flow-test";
+    const ratePrefix = "rate-limit:flow-test";
+    const transactionId = "00000000-0000-4000-8000-000000000060";
+    const cache = new RedisTransactionCache(redis, cachePrefix, 60);
+    let findByIdCalls = 0;
+    const trackingRepository: TransactionRepository = {
+      claimIdempotencyOperation: (operation) =>
+        repository.claimIdempotencyOperation(operation),
+      completeIdempotencyOperation: (operation) =>
+        repository.completeIdempotencyOperation(operation),
+      releaseIdempotencyOperation: (operation) =>
+        repository.releaseIdempotencyOperation(operation),
+      findById: async (id) => {
+        findByIdCalls += 1;
+        return repository.findById(id);
+      },
+      list: (offset, limit) => repository.list(offset, limit),
+      count: () => repository.count(),
+    };
+    const handler = createHttpHandler({
+      createTransaction: new CreateTransaction(
+        repository,
+        new ControlledProvider(),
+        { generate: () => transactionId },
+        { now: () => baseTime },
+        30_000,
+      ),
+      getTransaction: new GetTransaction(trackingRepository, cache),
+      listTransactions: new ListTransactions(trackingRepository),
+      rateLimiter: new RedisRateLimiter(redis, 100, 60_000, ratePrefix),
+    });
+
+    try {
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Client-Id": "redis-flow-client",
+      };
+      const created = await handler(
+        new Request("http://localhost/transactions", {
+          method: "POST",
+          headers: { ...headers, "Idempotency-Key": "redis-flow-key" },
+          body: JSON.stringify({
+            amount: 1099,
+            currency: "BRL",
+            description: "Redis flow",
+          }),
+        }),
+      );
+      const cacheKey = transactionCacheKey(cachePrefix, transactionId);
+
+      expect(created.status).toBe(201);
+      expect(
+        await redis.execute(() => redisClient.send("GET", [cacheKey])),
+      ).toBeNull();
+
+      const firstGet = await handler(
+        new Request(`http://localhost/transactions/${transactionId}`, {
+          headers,
+        }),
+      );
+      const secondGet = await handler(
+        new Request(`http://localhost/transactions/${transactionId}`, {
+          headers,
+        }),
+      );
+
+      expect(firstGet.status).toBe(200);
+      expect(secondGet.status).toBe(200);
+      expect(await firstGet.json()).toEqual(await secondGet.json());
+      expect(findByIdCalls).toBe(1);
+      expect(
+        await redis.execute(() => redisClient.send("GET", [cacheKey])),
+      ).not.toBeNull();
+    } finally {
+      await redis.execute(() =>
+        redisClient.send("DEL", [
+          transactionCacheKey(cachePrefix, transactionId),
+          `${ratePrefix}:redis-flow-client`,
+        ]),
+      );
+      redisClient.close();
+    }
   });
 });

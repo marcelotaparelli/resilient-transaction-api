@@ -40,7 +40,7 @@ async function applyRateLimit(
 
   const result = await rateLimiter.consume(parsedClientId.data);
   if (!result.allowed) {
-    return errorResponse("TOO_MANY_REQUESTS", "Too many requests", 429, {
+    return errorResponse("RATE_LIMIT_EXCEEDED", "Too many requests", 429, {
       headers: { "Retry-After": String(result.retryAfterSeconds) },
     });
   }

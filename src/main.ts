@@ -4,17 +4,46 @@ import { GetTransaction } from "./application/use-cases/get-transaction";
 import { ListTransactions } from "./application/use-cases/list-transactions";
 import { loadConfig } from "./config";
 import { createHttpHandler, startServer } from "./http/server";
+import { RedisTransactionCache } from "./infrastructure/cache/redis-transaction-cache";
 import { CircuitBreaker } from "./infrastructure/providers/circuit-breaker";
 import { HttpPaymentProvider } from "./infrastructure/providers/http-payment-provider";
 import { ResilientPaymentProvider } from "./infrastructure/providers/resilient-payment-provider";
 import { RetryPolicy } from "./infrastructure/providers/retry-policy";
-import { InMemoryRateLimiter } from "./infrastructure/rate-limit/in-memory-rate-limiter";
+import { RedisRateLimiter } from "./infrastructure/rate-limit/redis-rate-limiter";
+import {
+  createBunRedisClient,
+  RedisCommandExecutor,
+} from "./infrastructure/redis/redis-client";
 import { PostgresTransactionRepository } from "./infrastructure/repositories/postgres-transaction-repository";
 
 const config = loadConfig(Bun.env);
 const clock = { now: () => new Date() };
 const sql = new SQL(config.databaseUrl);
+const redisClient = createBunRedisClient(
+  config.redisUrl,
+  config.redisCommandTimeoutMs,
+);
+const redis = new RedisCommandExecutor(
+  redisClient,
+  config.redisCommandTimeoutMs,
+);
+const reportRedisFailure = (operation: string): void => {
+  console.warn(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: "warn",
+      event: "redis_operation_failed",
+      operation,
+    }),
+  );
+};
 const transactionRepository = new PostgresTransactionRepository(sql);
+const transactionCache = new RedisTransactionCache(
+  redis,
+  config.transactionCacheKeyPrefix,
+  config.transactionCacheTtlSeconds,
+  reportRedisFailure,
+);
 const httpPaymentProvider = new HttpPaymentProvider(
   config.providerUrl,
   config.retry.attemptTimeoutMs,
@@ -26,7 +55,13 @@ const paymentProvider = new ResilientPaymentProvider(
   { sleep: (delayMs) => Bun.sleep(delayMs) },
   { next: () => Math.random() },
 );
-const rateLimiter = new InMemoryRateLimiter(5, 60_000);
+const rateLimiter = new RedisRateLimiter(
+  redis,
+  config.rateLimitMaxRequests,
+  config.rateLimitWindowMs,
+  config.rateLimitKeyPrefix,
+  reportRedisFailure,
+);
 
 const createTransaction = new CreateTransaction(
   transactionRepository,
@@ -35,7 +70,10 @@ const createTransaction = new CreateTransaction(
   clock,
   config.processingStaleTimeoutMs,
 );
-const getTransaction = new GetTransaction(transactionRepository);
+const getTransaction = new GetTransaction(
+  transactionRepository,
+  transactionCache,
+);
 const listTransactions = new ListTransactions(transactionRepository);
 
 const handler = createHttpHandler({

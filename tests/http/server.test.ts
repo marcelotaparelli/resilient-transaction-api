@@ -174,6 +174,25 @@ describe("createHttpHandler", () => {
     });
   });
 
+  test("returns the distributed rate-limit envelope and precise Retry-After", async () => {
+    const deps = dependencies();
+    deps.rateLimiter.consume = async () => ({
+      allowed: false,
+      retryAfterSeconds: 17,
+    });
+
+    const response = await createHttpHandler(deps)(postRequest());
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("17");
+    expect(await response.json()).toEqual({
+      error: {
+        code: "RATE_LIMIT_EXCEEDED",
+        message: "Too many requests",
+      },
+    });
+  });
+
   test("does not expose unexpected error messages or stack traces", async () => {
     const deps = dependencies();
     deps.createTransaction.execute = async () => {

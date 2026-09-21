@@ -10,6 +10,13 @@ import {
 
 export type ApplicationConfig = {
   databaseUrl: string;
+  redisUrl: string;
+  redisCommandTimeoutMs: number;
+  transactionCacheTtlSeconds: number;
+  transactionCacheKeyPrefix: string;
+  rateLimitMaxRequests: number;
+  rateLimitWindowMs: number;
+  rateLimitKeyPrefix: string;
   providerUrl: string;
   retry: RetryPolicyConfig;
   breaker: CircuitBreakerConfig;
@@ -38,6 +45,35 @@ function number(
   return value;
 }
 
+function positiveInteger(
+  environment: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+): number {
+  const value = number(environment, name, fallback);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function redisUrl(environment: Record<string, string | undefined>): string {
+  const value = required(environment, "REDIS_URL");
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("REDIS_URL must be a valid Redis URL");
+  }
+
+  if (
+    !["redis:", "rediss:", "redis+tls:"].includes(parsed.protocol)
+  ) {
+    throw new Error("REDIS_URL must use a supported Redis protocol");
+  }
+  return value;
+}
+
 function timing(config: ApplicationConfig): ProviderTimingConfig {
   return {
     retry: config.retry,
@@ -59,6 +95,31 @@ export function loadConfig(
 
   const config: ApplicationConfig = {
     databaseUrl: required(environment, "DATABASE_URL"),
+    redisUrl: redisUrl(environment),
+    redisCommandTimeoutMs: positiveInteger(
+      environment,
+      "REDIS_COMMAND_TIMEOUT_MS",
+      250,
+    ),
+    transactionCacheTtlSeconds: positiveInteger(
+      environment,
+      "TRANSACTION_CACHE_TTL_SECONDS",
+      3_600,
+    ),
+    transactionCacheKeyPrefix:
+      environment.TRANSACTION_CACHE_KEY_PREFIX ?? "transaction-cache:v1",
+    rateLimitMaxRequests: positiveInteger(
+      environment,
+      "RATE_LIMIT_MAX_REQUESTS",
+      5,
+    ),
+    rateLimitWindowMs: positiveInteger(
+      environment,
+      "RATE_LIMIT_WINDOW_MS",
+      60_000,
+    ),
+    rateLimitKeyPrefix:
+      environment.RATE_LIMIT_KEY_PREFIX ?? "rate-limit:v1",
     providerUrl,
     retry: {
       maxAttempts: number(environment, "PROVIDER_MAX_ATTEMPTS", 3),
