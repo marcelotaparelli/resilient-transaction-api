@@ -7,8 +7,24 @@ import {
   type RetryPolicyConfig,
   validateProviderTiming,
 } from "./infrastructure/providers/retry-policy";
+import { z } from "zod";
+import type { ServiceCredentialConfig } from "./http/security/service-authenticator";
+
+const serviceCredentialsSchema = z
+  .array(
+    z
+      .object({
+        serviceId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/),
+        apiKeySha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
+      })
+      .strict(),
+  )
+  .min(1)
+  .max(100);
 
 export type ApplicationConfig = {
+  serviceCredentials: ServiceCredentialConfig[];
+  httpMaxBodyBytes: number;
   databaseUrl: string;
   redisUrl: string;
   redisCommandTimeoutMs: number;
@@ -24,6 +40,39 @@ export type ApplicationConfig = {
   executionOverheadMs: number;
   minimumStaleMarginMs: number;
 };
+
+function serviceCredentials(
+  environment: Record<string, string | undefined>,
+): ServiceCredentialConfig[] {
+  const raw = required(environment, "SERVICE_CREDENTIALS");
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("SERVICE_CREDENTIALS must be valid JSON");
+  }
+
+  const parsed = serviceCredentialsSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new Error("SERVICE_CREDENTIALS is invalid");
+  }
+
+  const serviceIds = new Set<string>();
+  const hashes = new Set<string>();
+  for (const credential of parsed.data) {
+    const hash = credential.apiKeySha256.toLowerCase();
+    if (serviceIds.has(credential.serviceId) || hashes.has(hash)) {
+      throw new Error("SERVICE_CREDENTIALS contains duplicate identities");
+    }
+    serviceIds.add(credential.serviceId);
+    hashes.add(hash);
+  }
+
+  return parsed.data.map((credential) => ({
+    serviceId: credential.serviceId,
+    apiKeySha256: credential.apiKeySha256.toLowerCase(),
+  }));
+}
 
 function required(environment: Record<string, string | undefined>, name: string): string {
   const value = environment[name];
@@ -94,6 +143,12 @@ export function loadConfig(
   }
 
   const config: ApplicationConfig = {
+    serviceCredentials: serviceCredentials(environment),
+    httpMaxBodyBytes: positiveInteger(
+      environment,
+      "HTTP_MAX_BODY_BYTES",
+      16_384,
+    ),
     databaseUrl: required(environment, "DATABASE_URL"),
     redisUrl: redisUrl(environment),
     redisCommandTimeoutMs: positiveInteger(
