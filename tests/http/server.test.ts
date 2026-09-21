@@ -30,9 +30,16 @@ const validBody = JSON.stringify({
   currency: "brl",
   description: "Order 123",
 });
+const validApiKey = "test-service-api-key-000000000001";
+const authorization = `Bearer ${validApiKey}`;
 
 function dependencies() {
   return {
+    authenticator: {
+      authenticate: async (apiKey: string) =>
+        apiKey === validApiKey ? { id: "service-a" } : null,
+    },
+    maxBodyBytes: 16_384,
     createTransaction: {
       execute: async () => ({ transaction, created: true }),
     },
@@ -56,6 +63,7 @@ function postRequest(): Request {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Authorization: authorization,
       "X-Client-Id": "test-client",
       "Idempotency-Key": "test-key",
     },
@@ -81,7 +89,7 @@ describe("createHttpHandler", () => {
     const handler = createHttpHandler(dependencies());
     const response = await handler(
       new Request(`http://localhost/transactions/${transaction.id}`, {
-        headers: { "X-Client-Id": "test-client" },
+        headers: { Authorization: authorization },
       }),
     );
 
@@ -101,7 +109,7 @@ describe("createHttpHandler", () => {
 
     const response = await handler(
       new Request(`http://localhost/transactions/${transaction.id}`, {
-        headers: { "X-Client-Id": "test-client" },
+        headers: { Authorization: authorization },
       }),
     );
 
@@ -213,7 +221,7 @@ describe("createHttpHandler", () => {
     const handler = createHttpHandler(dependencies());
     const response = await handler(
       new Request("http://localhost/transactions?page=1&limit=20&all=true", {
-        headers: { "X-Client-Id": "test-client" },
+        headers: { Authorization: authorization },
       }),
     );
 

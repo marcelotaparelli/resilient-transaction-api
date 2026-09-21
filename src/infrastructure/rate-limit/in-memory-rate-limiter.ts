@@ -16,12 +16,12 @@ export class InMemoryRateLimiter implements RateLimiter {
     private readonly windowMs: number,
   ) {}
 
-  async consume(clientId: string): Promise<RateLimitResult> {
+  async consume(subjectId: string): Promise<RateLimitResult> {
     const now = Date.now();
-    const entry = this.entries.get(clientId);
+    const entry = this.entries.get(subjectId);
 
     if (entry === undefined || now >= entry.resetAt) {
-      this.entries.set(clientId, {
+      this.entries.set(subjectId, {
         count: 1,
         resetAt: now + this.windowMs,
       });

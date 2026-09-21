@@ -4,6 +4,8 @@ import { GetTransaction } from "./application/use-cases/get-transaction";
 import { ListTransactions } from "./application/use-cases/list-transactions";
 import { loadConfig } from "./config";
 import { createHttpHandler, startServer } from "./http/server";
+import { redactSensitiveLogFields } from "./http/security/log-redaction";
+import { Sha256ServiceAuthenticator } from "./http/security/service-authenticator";
 import { RedisTransactionCache } from "./infrastructure/cache/redis-transaction-cache";
 import { CircuitBreaker } from "./infrastructure/providers/circuit-breaker";
 import { HttpPaymentProvider } from "./infrastructure/providers/http-payment-provider";
@@ -29,12 +31,14 @@ const redis = new RedisCommandExecutor(
 );
 const reportRedisFailure = (operation: string): void => {
   console.warn(
-    JSON.stringify({
-      timestamp: new Date().toISOString(),
-      level: "warn",
-      event: "redis_operation_failed",
-      operation,
-    }),
+    JSON.stringify(
+      redactSensitiveLogFields({
+        timestamp: new Date().toISOString(),
+        level: "warn",
+        event: "redis_operation_failed",
+        operation,
+      }),
+    ),
   );
 };
 const transactionRepository = new PostgresTransactionRepository(sql);
@@ -77,6 +81,8 @@ const getTransaction = new GetTransaction(
 const listTransactions = new ListTransactions(transactionRepository);
 
 const handler = createHttpHandler({
+  authenticator: new Sha256ServiceAuthenticator(config.serviceCredentials),
+  maxBodyBytes: config.httpMaxBodyBytes,
   createTransaction,
   getTransaction,
   listTransactions,

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  clientIdSchema,
   idempotencyKeySchema,
 } from "../../src/http/schemas/header-schema";
 import { paginationSchema } from "../../src/http/schemas/pagination-schema";
@@ -52,9 +51,10 @@ describe("HTTP schemas", () => {
     expect(result.success).toBeFalse();
   });
 
-  test("limits client and idempotency identifiers to 128 characters", () => {
-    expect(clientIdSchema.safeParse("x".repeat(129)).success).toBeFalse();
+  test("bounds and restricts idempotency identifiers", () => {
     expect(idempotencyKeySchema.safeParse("x".repeat(129)).success).toBeFalse();
+    expect(idempotencyKeySchema.safeParse("contains spaces").success).toBeFalse();
+    expect(idempotencyKeySchema.safeParse("valid:key-1").success).toBeTrue();
   });
 
   test("rejects a page limit above 100", () => {

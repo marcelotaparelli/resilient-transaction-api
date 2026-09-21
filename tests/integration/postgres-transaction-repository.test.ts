@@ -42,7 +42,10 @@ import {
   createBunRedisClient,
   RedisCommandExecutor,
 } from "../../src/infrastructure/redis/redis-client";
-import { transactionCacheKey } from "../../src/infrastructure/redis/redis-keys";
+import {
+  rateLimitKey,
+  transactionCacheKey,
+} from "../../src/infrastructure/redis/redis-keys";
 import { PostgresTransactionRepository } from "../../src/infrastructure/repositories/postgres-transaction-repository";
 
 const databaseUrl = Bun.env.TEST_DATABASE_URL;
@@ -753,10 +756,18 @@ describeWithPostgres("PostgresTransactionRepository", () => {
       list: (offset, limit) => repository.list(offset, limit),
       count: () => repository.count(),
     };
+    const provider = new ControlledProvider();
     const handler = createHttpHandler({
+      authenticator: {
+        authenticate: async (apiKey) =>
+          apiKey === "integration-service-api-key-000001"
+            ? { id: "integration-service" }
+            : null,
+      },
+      maxBodyBytes: 16_384,
       createTransaction: new CreateTransaction(
         repository,
-        new ControlledProvider(),
+        provider,
         { generate: () => transactionId },
         { now: () => baseTime },
         30_000,
@@ -769,8 +780,27 @@ describeWithPostgres("PostgresTransactionRepository", () => {
     try {
       const headers = {
         "Content-Type": "application/json",
-        "X-Client-Id": "redis-flow-client",
+        Authorization: "Bearer integration-service-api-key-000001",
       };
+      const unauthorized = await handler(
+        new Request("http://localhost/transactions", {
+          method: "POST",
+          headers: {
+            ...headers,
+            Authorization: "Bearer invalid-service-api-key-0000001",
+            "Idempotency-Key": "unauthorized-flow-key",
+          },
+          body: JSON.stringify({
+            amount: 1099,
+            currency: "BRL",
+            description: "Unauthorized flow",
+          }),
+        }),
+      );
+      expect(unauthorized.status).toBe(401);
+      expect(provider.calls).toBe(0);
+      expect(await repository.count()).toBe(0);
+
       const created = await handler(
         new Request("http://localhost/transactions", {
           method: "POST",
@@ -785,6 +815,7 @@ describeWithPostgres("PostgresTransactionRepository", () => {
       const cacheKey = transactionCacheKey(cachePrefix, transactionId);
 
       expect(created.status).toBe(201);
+      expect(provider.calls).toBe(1);
       expect(
         await redis.execute(() => redisClient.send("GET", [cacheKey])),
       ).toBeNull();
@@ -811,10 +842,83 @@ describeWithPostgres("PostgresTransactionRepository", () => {
       await redis.execute(() =>
         redisClient.send("DEL", [
           transactionCacheKey(cachePrefix, transactionId),
-          `${ratePrefix}:redis-flow-client`,
+          rateLimitKey(ratePrefix, "integration-service"),
         ]),
       );
       redisClient.close();
+    }
+  });
+
+  test("keeps authentication mandatory while unavailable Redis degrades to PostgreSQL", async () => {
+    const transactionId = "00000000-0000-4000-8000-000000000061";
+    const result = transaction(transactionId);
+    await repository.claimIdempotencyOperation({
+      idempotencyKey: "redis-down-security-key",
+      requestFingerprint: fingerprint,
+      claimedAt: baseTime,
+      staleBefore: new Date(baseTime.getTime() - 30_000),
+    });
+    await repository.completeIdempotencyOperation({
+      idempotencyKey: "redis-down-security-key",
+      requestFingerprint: fingerprint,
+      transaction: result,
+      completedAt: baseTime,
+    });
+
+    const unavailableClient = createBunRedisClient(
+      "redis://127.0.0.1:1/15",
+      20,
+    );
+    const unavailableRedis = new RedisCommandExecutor(unavailableClient, 20);
+    const handler = createHttpHandler({
+      authenticator: {
+        authenticate: async (apiKey) =>
+          apiKey === "integration-service-api-key-000001"
+            ? { id: "integration-service" }
+            : null,
+      },
+      maxBodyBytes: 16_384,
+      createTransaction: new CreateTransaction(
+        repository,
+        new ControlledProvider(),
+        { generate: () => "00000000-0000-4000-8000-000000000062" },
+        { now: () => baseTime },
+        30_000,
+      ),
+      getTransaction: new GetTransaction(
+        repository,
+        new RedisTransactionCache(
+          unavailableRedis,
+          "transaction-cache:security-down-test",
+          60,
+        ),
+      ),
+      listTransactions: new ListTransactions(repository),
+      rateLimiter: new RedisRateLimiter(
+        unavailableRedis,
+        5,
+        60_000,
+        "rate-limit:security-down-test",
+      ),
+    });
+
+    try {
+      const unauthorized = await handler(
+        new Request(`http://localhost/transactions/${transactionId}`),
+      );
+      const authorized = await handler(
+        new Request(`http://localhost/transactions/${transactionId}`, {
+          headers: {
+            Authorization: "Bearer integration-service-api-key-000001",
+          },
+        }),
+      );
+
+      expect(unauthorized.status).toBe(401);
+      expect(authorized.status).toBe(200);
+      expect(await authorized.json()).toMatchObject({ id: transactionId });
+    } finally {
+      unavailableClient.close();
     }
   });
 });

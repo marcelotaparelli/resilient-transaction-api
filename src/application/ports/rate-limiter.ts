@@ -4,5 +4,5 @@ export type RateLimitResult = {
 };
 
 export interface RateLimiter {
-  consume(clientId: string): Promise<RateLimitResult>;
+  consume(subjectId: string): Promise<RateLimitResult>;
 }

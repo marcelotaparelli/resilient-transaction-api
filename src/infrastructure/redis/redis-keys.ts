@@ -9,7 +9,7 @@ export function transactionCacheKey(prefix: string, transactionId: string): stri
   return `${prefix}:${encodeURIComponent(transactionId)}`;
 }
 
-export function rateLimitKey(prefix: string, clientId: string): string {
+export function rateLimitKey(prefix: string, subjectId: string): string {
   validatePrefix(prefix);
-  return `${prefix}:${encodeURIComponent(clientId)}`;
+  return `${prefix}:${encodeURIComponent(subjectId)}`;
 }

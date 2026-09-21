@@ -57,9 +57,9 @@ export class RedisRateLimiter implements RateLimiter {
     rateLimitKey(keyPrefix, "validation");
   }
 
-  async consume(clientId: string): Promise<RateLimitResult> {
+  async consume(subjectId: string): Promise<RateLimitResult> {
     try {
-      const key = rateLimitKey(this.keyPrefix, clientId);
+      const key = rateLimitKey(this.keyPrefix, subjectId);
       const raw = await this.redis.execute(() =>
         this.redis.client.send("EVAL", [
           consumeFixedWindowScript,
