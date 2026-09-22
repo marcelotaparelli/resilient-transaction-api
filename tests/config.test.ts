@@ -30,6 +30,8 @@ describe("loadConfig", () => {
     expect(config.rateLimitMaxRequests).toBe(5);
     expect(config.rateLimitWindowMs).toBe(60_000);
     expect(config.httpMaxBodyBytes).toBe(16_384);
+    expect(config.httpHost).toBe("0.0.0.0");
+    expect(config.httpPort).toBe(4_002);
     expect(config.readinessTimeoutMs).toBe(500);
     expect(config.shutdownGracePeriodMs).toBe(15_000);
     expect(config.serviceCredentials).toEqual([
@@ -124,5 +126,23 @@ describe("loadConfig", () => {
         SHUTDOWN_GRACE_PERIOD_MS: "10000",
       }),
     ).toThrow("Shutdown grace period");
+  });
+
+  test("accepts an external HTTP bind and rejects invalid ports", () => {
+    const base = {
+      DATABASE_URL: "postgres://localhost/test",
+      REDIS_URL: "redis://localhost:6379",
+      SERVICE_CREDENTIALS: serviceCredentials,
+    };
+
+    expect(
+      loadConfig({ ...base, HTTP_HOST: "127.0.0.1", PORT: "8080" }),
+    ).toMatchObject({ httpHost: "127.0.0.1", httpPort: 8_080 });
+    expect(() => loadConfig({ ...base, PORT: "0" })).toThrow(
+      "positive safe integer",
+    );
+    expect(() => loadConfig({ ...base, PORT: "65536" })).toThrow(
+      "between 1 and 65535",
+    );
   });
 });

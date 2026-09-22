@@ -153,7 +153,7 @@ const handler = createHttpHandler({
   requestTracker,
 });
 
-const server = startServer(handler);
+const server = startServer(handler, config.httpPort, config.httpHost);
 logger.log("info", "startup.ready", { state: startupReadiness.status });
 
 const shutdown = new GracefulShutdownCoordinator(

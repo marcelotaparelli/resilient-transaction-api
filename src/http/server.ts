@@ -489,6 +489,7 @@ export function createHttpHandler(
 export function startServer(
   handler: HttpHandler,
   port = 4002,
+  hostname = "0.0.0.0",
 ): ReturnType<typeof Bun.serve> {
-  return Bun.serve({ port, fetch: handler });
+  return Bun.serve({ hostname, port, fetch: handler });
 }

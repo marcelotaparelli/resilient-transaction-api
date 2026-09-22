@@ -23,6 +23,8 @@ const serviceCredentialsSchema = z
   .max(100);
 
 export type ApplicationConfig = {
+  httpHost: string;
+  httpPort: number;
   serviceCredentials: ServiceCredentialConfig[];
   httpMaxBodyBytes: number;
   databaseUrl: string;
@@ -108,6 +110,16 @@ function positiveInteger(
   return value;
 }
 
+function httpPort(
+  environment: Record<string, string | undefined>,
+): number {
+  const value = positiveInteger(environment, "PORT", 4_002);
+  if (value > 65_535) {
+    throw new Error("PORT must be between 1 and 65535");
+  }
+  return value;
+}
+
 function redisUrl(environment: Record<string, string | undefined>): string {
   const value = required(environment, "REDIS_URL");
   let parsed: URL;
@@ -145,6 +157,8 @@ export function loadConfig(
   }
 
   const config: ApplicationConfig = {
+    httpHost: environment.HTTP_HOST?.trim() || "0.0.0.0",
+    httpPort: httpPort(environment),
     serviceCredentials: serviceCredentials(environment),
     httpMaxBodyBytes: positiveInteger(
       environment,
