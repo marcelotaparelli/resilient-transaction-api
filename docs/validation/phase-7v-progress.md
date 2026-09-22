@@ -20,6 +20,16 @@ Date: 2026-09-22
 - The API container runs with a read-only root filesystem, all capabilities dropped and `no-new-privileges` enabled.
 - Only the API port 4002 is published to the host; PostgreSQL and Redis remain private to the Compose network.
 
+## Additional runtime evidence
+
+- `/health/live` returned 200 and `/health/ready` returned 200 `{"status":"ready"}` with both dependencies healthy.
+- Authenticated POST returned 201 and authenticated GET returned 200. A second GET was served from the transaction cache; metrics reported one cache miss and one cache hit.
+- An unauthenticated GET returned 401. No credential, Authorization header, complete Idempotency-Key, database URL or Redis URL appeared in the inspected API logs; all 66 inspected log lines were valid JSON.
+- After restarting only the API, the transaction remained available from PostgreSQL.
+- With Redis stopped, readiness returned 200 `degraded`, authenticated GET continued through PostgreSQL, and unauthenticated GET remained 401. Redis restoration returned readiness to 200 `ready`.
+- With PostgreSQL stopped, liveness remained 200, readiness returned 503 `not_ready`, and the Docker health status became `unhealthy`. Restoring PostgreSQL returned readiness to 200.
+- A real `docker-compose stop -t 20 api` during a 2-second provider request took 2,310 ms. Logs showed `shutdown.started` with one in-flight request, the request completed with 201, then `shutdown.completed`; the container exited 0 without SIGKILL. A new connection during drain was refused.
+
 ## Environment adjustment
 
 The validation host initially lacked Docker. Its nested filesystem does not support Docker `overlay2`; the fallback `vfs` driver duplicated layers and exhausted the small root filesystem during the PostgreSQL pull. The daemon was restarted with `fuse-overlayfs` and a temporary data root under `/workspace/.docker-runtime`. This is validation infrastructure and is not an application change.
@@ -33,4 +43,3 @@ The validation host initially lacked Docker. Its nested filesystem does not supp
 - Redis and PostgreSQL outage behavior and recovery.
 - Real in-flight SIGTERM/graceful shutdown timing.
 - Full portable, PostgreSQL and Redis test suites against the running dependencies.
-
