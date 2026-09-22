@@ -262,6 +262,8 @@ O fake provider mantém sua própria idempotência em memória. Nos cenários `t
 | Variável | Default |
 | --- | ---: |
 | `SERVICE_CREDENTIALS` | obrigatório; JSON sem default |
+| `HTTP_HOST` | `0.0.0.0` |
+| `PORT` | `4002` |
 | `HTTP_MAX_BODY_BYTES` | `16384` |
 | `READINESS_TIMEOUT_MS` | `500` |
 | `SHUTDOWN_GRACE_PERIOD_MS` | `15000` |
@@ -282,6 +284,37 @@ O fake provider mantém sua própria idempotência em memória. Nos cenários `t
 | `RATE_LIMIT_MAX_REQUESTS` | `5` |
 | `RATE_LIMIT_WINDOW_MS` | `60000` |
 | `RATE_LIMIT_KEY_PREFIX` | `rate-limit:v1` |
+
+## Execução containerizada local
+
+O runtime usa `oven/bun:1.4.2-slim`, fixado na mesma versão do Bun usada pelo projeto e pelo lockfile atual. O Dockerfile tem stages separados para dependências de produção, runtime, provider fake e quality checks. A imagem final executa TypeScript diretamente com `bun src/main.ts`, sem bundling ou processo intermediário, como usuário não-root `bun`.
+
+O contexto exclui Git, agentes, `.env`, dependências locais, coverage, reports, logs e artefatos de editor. A API é stateless no filesystem: não grava arquivos e usa apenas PostgreSQL/Redis externos para seu estado operacional. Logs vão para stdout/stderr; métricas permanecem na memória do processo.
+
+O Compose define `postgres`, `redis`, um job `migration`, `provider` e `api` em uma rede privada. Apenas a porta da API é publicada. A API aguarda PostgreSQL saudável e migrations concluídas; Redis não participa da ordem crítica de startup porque pode ficar degraded. PostgreSQL usa volume nomeado. Redis é descartável, sem volume, porque cache e rate limiting não são source of truth.
+
+```bash
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+O healthcheck da imagem consulta `/health/ready` usando o Bun, sem instalar `curl` ou `wget`. O healthcheck considera Redis down como resposta HTTP 200 `degraded`, mas considera PostgreSQL down como 503. Para o smoke test local, a credential padrão do Compose é explicitamente apenas de desenvolvimento: `compose-smoke-api-key-000000000001`; altere `SERVICE_API_KEY_SHA256` para qualquer outro ambiente.
+
+```bash
+curl -i http://localhost:4002/health/live
+curl -i http://localhost:4002/health/ready
+curl -i http://localhost:4002/metrics
+curl -i -X POST http://localhost:4002/transactions \
+  -H 'Authorization: Bearer compose-smoke-api-key-000000000001' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: compose-container-001' \
+  -d '{"amount":1099,"currency":"BRL","description":"Compose smoke"}'
+```
+
+Migrations não rodam no startup da API: o serviço `migration` termina com sucesso antes da API iniciar. `docker compose stop -t 20 api` envia SIGTERM com 20 segundos, acima do grace period padrão de 15 segundos; o processo marca readiness como not ready, drena requests in-flight e fecha HTTP, Redis e PostgreSQL. O processo Bun é o comando do container, sem supervisor ou init adicional.
+
+Para simular degradação, pare Redis: `docker compose stop redis`; readiness continua 200 com `degraded` e GET individual cai para PostgreSQL. Parar PostgreSQL torna readiness 503. A imagem não contém `.env`, secrets reais, `.git`, testes ou documentação operacional.
 
 ## Como rodar
 
@@ -359,4 +392,5 @@ A suíte de integração aplica migrations a partir de vazio, testa constraints,
 - métricas, logs e breaker são locais por réplica e perdem estado no restart;
 - o timeout de readiness limita a espera HTTP, mas não garante cancelamento de comando já enviado;
 - shutdown é bounded e pode interromper trabalho que ultrapasse o grace period;
-- não há Docker ou infraestrutura AWS.
+- o Compose é voltado a desenvolvimento e smoke tests; não inclui infraestrutura AWS;
+- a imagem não implementa políticas de deployment, registry ou coleta externa de logs/métricas.
