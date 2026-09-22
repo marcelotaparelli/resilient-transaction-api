@@ -1,0 +1,102 @@
+version: "2.4"
+
+x-bun-service: &bun-service
+  image: resilient-transaction-api:local
+  build:
+    context: .
+    target: runtime
+    args:
+      BUN_VERSION: "1.4.2"
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - transaction-network
+
+services:
+  postgres:
+    image: postgres:15.19-bookworm
+    environment:
+      POSTGRES_DB: resilient_transactions
+      POSTGRES_USER: resilient_app
+      # Development-only credential; override through the host environment when needed.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-compose-development-postgres-password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resilient_app -d resilient_transactions"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - transaction-network
+
+  redis:
+    image: redis:7.2.16-bookworm
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+    networks:
+      - transaction-network
+
+  migration:
+    <<: *bun-service
+    command: ["bun", "src/infrastructure/database/migrate.ts"]
+    environment:
+      DATABASE_URL: postgres://resilient_app:${POSTGRES_PASSWORD:-compose-development-postgres-password}@postgres:5432/resilient_transactions
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  provider:
+    <<: *bun-service
+    image: resilient-transaction-provider:local
+    build:
+      context: .
+      target: provider
+      args:
+        BUN_VERSION: "1.4.2"
+    command: ["bun", "src/dev/provider.ts"]
+    environment:
+      PROVIDER_OUTCOMES: ${PROVIDER_OUTCOMES:-success}
+      PROVIDER_LATENCY_MS: ${PROVIDER_LATENCY_MS:-0}
+      PROVIDER_TIMEOUT_DELAY_MS: ${PROVIDER_TIMEOUT_DELAY_MS:-60000}
+    restart: unless-stopped
+
+  api:
+    <<: *bun-service
+    environment:
+      DATABASE_URL: postgres://resilient_app:${POSTGRES_PASSWORD:-compose-development-postgres-password}@postgres:5432/resilient_transactions
+      REDIS_URL: redis://redis:6379
+      PROVIDER_URL: http://provider:4003/transactions
+      # Hash of the explicitly local-only key documented in README.
+      SERVICE_CREDENTIALS: '[{"serviceId":"compose-smoke","apiKeySha256":"${SERVICE_API_KEY_SHA256:-55778389f7ec63ffd272459c7ff7bce155e31e0389b968e594fc9804d387b143}"}]'
+      HTTP_HOST: 0.0.0.0
+      PORT: 4002
+      SHUTDOWN_GRACE_PERIOD_MS: 15000
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      provider:
+        condition: service_started
+    ports:
+      - "${API_PORT:-4002}:4002"
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+
+networks:
+  transaction-network:
+    driver: bridge
