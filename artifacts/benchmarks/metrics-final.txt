@@ -1,0 +1,60 @@
+# HELP http_requests_total Total HTTP responses.
+# TYPE http_requests_total counter
+# HELP http_errors_total Total HTTP error responses by status class.
+# TYPE http_errors_total counter
+# HELP http_request_duration_seconds HTTP response latency in seconds.
+# TYPE http_request_duration_seconds histogram
+# TYPE provider_failures_total counter
+# TYPE provider_requests_total counter
+# TYPE provider_retries_total counter
+http_errors_total{class="4xx",route="/transactions"} 15
+http_requests_total{method="GET",route="/health/ready",status="200"} 31
+http_requests_total{method="POST",route="/transactions",status="200"} 4
+http_requests_total{method="POST",route="/transactions",status="201"} 102
+http_requests_total{method="POST",route="/transactions",status="409"} 15
+provider_failures_total{category="server"} 1
+provider_requests_total 103
+provider_retries_total 1
+http_request_duration_seconds_bucket{le="0.005",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.01",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.025",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.05",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.1",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.25",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.5",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="1",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="2.5",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="5",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="10",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="+Inf",method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_sum{method="GET",route="/health/ready",status_class="2xx"} 0.023041236999942163
+http_request_duration_seconds_count{method="GET",route="/health/ready",status_class="2xx"} 31
+http_request_duration_seconds_bucket{le="0.005",method="POST",route="/transactions",status_class="2xx"} 0
+http_request_duration_seconds_bucket{le="0.01",method="POST",route="/transactions",status_class="2xx"} 0
+http_request_duration_seconds_bucket{le="0.025",method="POST",route="/transactions",status_class="2xx"} 0
+http_request_duration_seconds_bucket{le="0.05",method="POST",route="/transactions",status_class="2xx"} 5
+http_request_duration_seconds_bucket{le="0.1",method="POST",route="/transactions",status_class="2xx"} 5
+http_request_duration_seconds_bucket{le="0.25",method="POST",route="/transactions",status_class="2xx"} 105
+http_request_duration_seconds_bucket{le="0.5",method="POST",route="/transactions",status_class="2xx"} 105
+http_request_duration_seconds_bucket{le="1",method="POST",route="/transactions",status_class="2xx"} 106
+http_request_duration_seconds_bucket{le="2.5",method="POST",route="/transactions",status_class="2xx"} 106
+http_request_duration_seconds_bucket{le="5",method="POST",route="/transactions",status_class="2xx"} 106
+http_request_duration_seconds_bucket{le="10",method="POST",route="/transactions",status_class="2xx"} 106
+http_request_duration_seconds_bucket{le="+Inf",method="POST",route="/transactions",status_class="2xx"} 106
+http_request_duration_seconds_sum{method="POST",route="/transactions",status_class="2xx"} 12.005943545000028
+http_request_duration_seconds_count{method="POST",route="/transactions",status_class="2xx"} 106
+http_request_duration_seconds_bucket{le="0.005",method="POST",route="/transactions",status_class="4xx"} 0
+http_request_duration_seconds_bucket{le="0.01",method="POST",route="/transactions",status_class="4xx"} 0
+http_request_duration_seconds_bucket{le="0.025",method="POST",route="/transactions",status_class="4xx"} 1
+http_request_duration_seconds_bucket{le="0.05",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="0.1",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="0.25",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="0.5",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="1",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="2.5",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="5",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="10",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_bucket{le="+Inf",method="POST",route="/transactions",status_class="4xx"} 15
+http_request_duration_seconds_sum{method="POST",route="/transactions",status_class="4xx"} 0.44628826699999624
+http_request_duration_seconds_count{method="POST",route="/transactions",status_class="4xx"} 15
+

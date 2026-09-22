@@ -1,0 +1,3 @@
+{"scenario":"cache-hit","run":1,"requests":300,"concurrency":25,"durationMs":44.189,"completed":300,"successful":300,"errors":0,"requestsPerSecond":6788.969,"p50Ms":3.355,"p95Ms":5.359,"p99Ms":6.004,"statuses":{"200":300}}
+{"scenario":"cache-hit","run":2,"requests":300,"concurrency":25,"durationMs":39.663,"completed":300,"successful":300,"errors":0,"requestsPerSecond":7563.762,"p50Ms":3.013,"p95Ms":5.108,"p99Ms":5.553,"statuses":{"200":300}}
+{"scenario":"cache-hit","run":3,"requests":300,"concurrency":25,"durationMs":36.49,"completed":300,"successful":300,"errors":0,"requestsPerSecond":8221.45,"p50Ms":2.827,"p95Ms":3.987,"p99Ms":5.941,"statuses":{"200":300}}

@@ -1,0 +1,3 @@
+{"scenario":"cache-miss","run":1,"requests":300,"concurrency":25,"durationMs":94.01,"completed":300,"successful":300,"errors":0,"requestsPerSecond":3191.147,"p50Ms":7.572,"p95Ms":10.842,"p99Ms":11.782,"statuses":{"200":300}}
+{"scenario":"cache-miss","run":2,"requests":300,"concurrency":25,"durationMs":88.235,"completed":300,"successful":300,"errors":0,"requestsPerSecond":3400.002,"p50Ms":7.284,"p95Ms":9.013,"p99Ms":10.024,"statuses":{"200":300}}
+{"scenario":"cache-miss","run":3,"requests":300,"concurrency":25,"durationMs":91.554,"completed":300,"successful":300,"errors":0,"requestsPerSecond":3276.759,"p50Ms":7.047,"p95Ms":10.775,"p99Ms":13.313,"statuses":{"200":300}}

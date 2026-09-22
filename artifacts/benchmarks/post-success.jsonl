@@ -1,0 +1,3 @@
+{"scenario":"post-success","run":1,"requests":300,"concurrency":25,"durationMs":258.313,"completed":300,"successful":300,"errors":0,"requestsPerSecond":1161.382,"p50Ms":19.946,"p95Ms":31.237,"p99Ms":36.43,"statuses":{"201":300}}
+{"scenario":"post-success","run":2,"requests":300,"concurrency":25,"durationMs":278.252,"completed":300,"successful":300,"errors":0,"requestsPerSecond":1078.158,"p50Ms":21.975,"p95Ms":32.417,"p99Ms":36.147,"statuses":{"201":300}}
+{"scenario":"post-success","run":3,"requests":300,"concurrency":25,"durationMs":260.86,"completed":300,"successful":300,"errors":0,"requestsPerSecond":1150.043,"p50Ms":20.691,"p95Ms":31.76,"p99Ms":34.253,"statuses":{"201":300}}

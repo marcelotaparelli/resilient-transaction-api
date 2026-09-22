@@ -1,0 +1,1 @@
+{"scenario":"post-success","run":1,"requests":100,"concurrency":10,"durationMs":1138.758,"completed":100,"successful":100,"errors":0,"requestsPerSecond":87.815,"p50Ms":109.281,"p95Ms":149.119,"p99Ms":153.961,"statuses":{"201":100}}

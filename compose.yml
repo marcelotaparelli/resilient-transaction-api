@@ -83,6 +83,8 @@ services:
       SERVICE_CREDENTIALS: '[{"serviceId":"compose-smoke","apiKeySha256":"${SERVICE_API_KEY_SHA256:-55778389f7ec63ffd272459c7ff7bce155e31e0389b968e594fc9804d387b143}"}]'
       HTTP_HOST: 0.0.0.0
       PORT: 4002
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-5}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
       SHUTDOWN_GRACE_PERIOD_MS: 15000
     depends_on:
       migration:

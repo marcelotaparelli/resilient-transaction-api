@@ -377,6 +377,14 @@ bun run typecheck
 
 A suíte de integração aplica migrations a partir de vazio, testa constraints, idempotência concorrente, provider resilience, rate limit atômico concorrente, compartilhamento entre adapters, TTL, cache inválido, Redis indisponível e o fluxo HTTP completo `POST → cache MISS → cache HIT`.
 
+## Benchmark
+
+O harness reproduzível está em `benchmarks/http-benchmark.ts`. A baseline medida
+no stack Docker local, com ambiente e limitações completos, está em
+[`docs/performance/phase-8-baseline.md`](docs/performance/phase-8-baseline.md),
+com resultados JSONL em `artifacts/benchmarks/`. Os números são locais e não
+representam AWS ou produção; não foram aplicadas otimizações sem evidência.
+
 ## Limitações atuais
 
 - a correção do side effect externo depende da idempotência oferecida pelo provider;
