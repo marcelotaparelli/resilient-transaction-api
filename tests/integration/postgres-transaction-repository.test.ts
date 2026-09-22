@@ -47,6 +47,12 @@ import {
   transactionCacheKey,
 } from "../../src/infrastructure/redis/redis-keys";
 import { PostgresTransactionRepository } from "../../src/infrastructure/repositories/postgres-transaction-repository";
+import { ApplicationMetrics } from "../../src/infrastructure/observability/metrics";
+import {
+  ObservedRateLimiter,
+  ObservedTransactionCache,
+} from "../../src/infrastructure/observability/observed-adapters";
+import { ReadinessService } from "../../src/infrastructure/operability/readiness";
 
 const databaseUrl = Bun.env.TEST_DATABASE_URL;
 const redisUrl = Bun.env.TEST_REDIS_URL;
@@ -740,7 +746,11 @@ describeWithPostgres("PostgresTransactionRepository", () => {
     const cachePrefix = "transaction-cache:flow-test";
     const ratePrefix = "rate-limit:flow-test";
     const transactionId = "00000000-0000-4000-8000-000000000060";
-    const cache = new RedisTransactionCache(redis, cachePrefix, 60);
+    const metrics = new ApplicationMetrics();
+    const cache = new ObservedTransactionCache(
+      new RedisTransactionCache(redis, cachePrefix, 60),
+      metrics,
+    );
     let findByIdCalls = 0;
     const trackingRepository: TransactionRepository = {
       claimIdempotencyOperation: (operation) =>
@@ -774,7 +784,18 @@ describeWithPostgres("PostgresTransactionRepository", () => {
       ),
       getTransaction: new GetTransaction(trackingRepository, cache),
       listTransactions: new ListTransactions(trackingRepository),
-      rateLimiter: new RedisRateLimiter(redis, 100, 60_000, ratePrefix),
+      rateLimiter: new ObservedRateLimiter(
+        new RedisRateLimiter(redis, 100, 60_000, ratePrefix),
+        metrics,
+      ),
+      metrics,
+      readiness: new ReadinessService(
+        async () => { await sql`SELECT 1`; },
+        async () => { await redis.execute(() => redisClient.send("PING", [])); },
+        100,
+        () => false,
+        metrics,
+      ),
     });
 
     try {
@@ -782,6 +803,10 @@ describeWithPostgres("PostgresTransactionRepository", () => {
         "Content-Type": "application/json",
         Authorization: "Bearer integration-service-api-key-000001",
       };
+      const ready = await handler(
+        new Request("http://localhost/health/ready"),
+      );
+      expect(ready.status).toBe(200);
       const unauthorized = await handler(
         new Request("http://localhost/transactions", {
           method: "POST",
@@ -835,6 +860,14 @@ describeWithPostgres("PostgresTransactionRepository", () => {
       expect(secondGet.status).toBe(200);
       expect(await firstGet.json()).toEqual(await secondGet.json());
       expect(findByIdCalls).toBe(1);
+      expect(metrics.value("cache_miss_total")).toBe(1);
+      expect(metrics.value("cache_hit_total")).toBe(1);
+      const metricResponse = await handler(
+        new Request("http://localhost/metrics"),
+      );
+      const metricText = await metricResponse.text();
+      expect(metricText).toContain("http_requests_total");
+      expect(metricText).toContain("cache_hit_total 1");
       expect(
         await redis.execute(() => redisClient.send("GET", [cacheKey])),
       ).not.toBeNull();
@@ -847,6 +880,45 @@ describeWithPostgres("PostgresTransactionRepository", () => {
       );
       redisClient.close();
     }
+  });
+
+  testWithRedis("reports real dependency readiness as ready, degraded, then not ready", async () => {
+    const isolatedSql = new SQL(databaseUrl as string, { max: 1 });
+    const isolatedRedisClient = createBunRedisClient(redisUrl as string, 50);
+    const isolatedRedis = new RedisCommandExecutor(isolatedRedisClient, 50);
+    const readiness = new ReadinessService(
+      async () => { await isolatedSql`SELECT 1`; },
+      async () => {
+        await isolatedRedis.execute(() => isolatedRedisClient.send("PING", []));
+      },
+      100,
+      () => false,
+    );
+
+    expect(await readiness.check()).toEqual({ status: "ready" });
+    isolatedRedisClient.close();
+    const unavailableRedisClient = createBunRedisClient(
+      "redis://127.0.0.1:1/15",
+      20,
+    );
+    const unavailableRedis = new RedisCommandExecutor(
+      unavailableRedisClient,
+      20,
+    );
+    const degradedReadiness = new ReadinessService(
+      async () => { await isolatedSql`SELECT 1`; },
+      async () => {
+        await unavailableRedis.execute(() =>
+          unavailableRedisClient.send("PING", []),
+        );
+      },
+      50,
+      () => false,
+    );
+    expect(await degradedReadiness.check()).toEqual({ status: "degraded" });
+    await isolatedSql.close();
+    expect(await degradedReadiness.check()).toEqual({ status: "not_ready" });
+    unavailableRedisClient.close();
   });
 
   test("keeps authentication mandatory while unavailable Redis degrades to PostgreSQL", async () => {

@@ -10,9 +10,20 @@ import type {
   AuthenticatedService,
   ServiceAuthenticator,
 } from "./security/service-authenticator";
+import type { OperationalLogger } from "../infrastructure/observability/logger";
+import { noOpLogger } from "../infrastructure/observability/logger";
+import type { ApplicationMetrics } from "../infrastructure/observability/metrics";
+import { runWithRequestContext } from "../infrastructure/observability/request-context";
+import type { InFlightRequestTracker } from "../infrastructure/operability/lifecycle";
+import type {
+  ReadinessResult,
+  ReadinessService,
+} from "../infrastructure/operability/readiness";
 
 const authorizationHeaderMaxLength = 512;
 const bearerTokenPattern = /^Bearer ([A-Za-z0-9\-._~+/=]{32,256})$/i;
+const requestIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type ServerDependencies = {
   authenticator: ServiceAuthenticator;
@@ -21,6 +32,12 @@ type ServerDependencies = {
   getTransaction: Pick<GetTransaction, "execute">;
   listTransactions: Pick<ListTransactions, "execute">;
   rateLimiter: RateLimiter;
+  logger?: OperationalLogger;
+  metrics?: ApplicationMetrics;
+  readiness?: Pick<ReadinessService, "check">;
+  requestTracker?: InFlightRequestTracker;
+  requestIdGenerator?: () => string;
+  monotonicNow?: () => number;
 };
 
 export type HttpHandler = (request: Request) => Promise<Response>;
@@ -160,6 +177,7 @@ async function readBoundedJson(
 async function routeRequest(
   request: Request,
   dependencies: ServerDependencies,
+  requestId: string,
 ): Promise<Response> {
   const url = new URL(request.url);
 
@@ -168,6 +186,23 @@ async function routeRequest(
     (url.pathname === "/health" || url.pathname === "/health/live")
   ) {
     return json({ status: "ok" });
+  }
+
+  if (request.method === "GET" && url.pathname === "/health/ready") {
+    if (dependencies.readiness === undefined) {
+      return errorResponse("NOT_READY", "Service is not ready", 503);
+    }
+    const readiness: ReadinessResult = await dependencies.readiness.check();
+    return json(readiness, readiness.status === "not_ready" ? 503 : 200);
+  }
+
+  if (request.method === "GET" && url.pathname === "/metrics") {
+    return new Response(dependencies.metrics?.render() ?? "", {
+      status: 200,
+      headers: {
+        "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+      },
+    });
   }
 
   const isList = request.method === "GET" && url.pathname === "/transactions";
@@ -188,12 +223,26 @@ async function routeRequest(
   }
 
   const authentication = await authenticate(request, dependencies.authenticator);
-  if (authentication instanceof Response) return authentication;
+  if (authentication instanceof Response) {
+    dependencies.logger?.log("warn", "auth.failed", {
+      requestId,
+      method: request.method,
+      route: routeTemplate(request),
+    });
+    return authentication;
+  }
   const rateLimitResponse = await applyRateLimit(
     authentication.id,
     dependencies.rateLimiter,
   );
-  if (rateLimitResponse !== null) return rateLimitResponse;
+  if (rateLimitResponse !== null) {
+    dependencies.logger?.log("warn", "rate_limit.rejected", {
+      requestId,
+      method: request.method,
+      route: routeTemplate(request),
+    });
+    return rateLimitResponse;
+  }
 
   if (isList) {
     const parsedPagination = paginationSchema.safeParse(
@@ -291,15 +340,149 @@ async function routeRequest(
   return errorResponse("NOT_FOUND", "Route not found", 404);
 }
 
+function routeTemplate(request: Request): string {
+  const pathname = new URL(request.url).pathname;
+  if (/^\/transactions\/[^/]+$/.test(pathname)) return "/transactions/:id";
+  if (
+    pathname === "/transactions" ||
+    pathname === "/health" ||
+    pathname === "/health/live" ||
+    pathname === "/health/ready" ||
+    pathname === "/metrics"
+  ) {
+    return pathname;
+  }
+  return "unmatched";
+}
+
+function requestIdFrom(request: Request, generator: () => string): string {
+  const supplied = request.headers.get("X-Request-Id");
+  if (supplied !== null && requestIdPattern.test(supplied)) return supplied;
+
+  const generated = generator();
+  return requestIdPattern.test(generated) ? generated : crypto.randomUUID();
+}
+
+async function attachRequestId(
+  response: Response,
+  requestId: string,
+): Promise<{ response: Response; errorCode?: string }> {
+  const headers = new Headers(response.headers);
+  headers.set("X-Request-Id", requestId);
+  if (response.status < 400) {
+    return {
+      response: new Response(response.body, { status: response.status, headers }),
+    };
+  }
+
+  try {
+    const text = await response.text();
+    const body = JSON.parse(text) as {
+      error?: { code?: unknown; message?: unknown; details?: unknown };
+    };
+    if (
+      body.error !== undefined &&
+      typeof body.error.code === "string" &&
+      typeof body.error.message === "string"
+    ) {
+      const error =
+        body.error.details === undefined
+          ? { ...body.error, requestId }
+          : { ...body.error, requestId, details: body.error.details };
+      return {
+        response: Response.json(
+          { error },
+          { status: response.status, headers },
+        ),
+        errorCode: body.error.code,
+      };
+    }
+    return {
+      response: new Response(text, { status: response.status, headers }),
+    };
+  } catch {
+    // Every current HTTP error uses the safe JSON envelope; keep a safe fallback.
+  }
+
+  return {
+    response: new Response(null, { status: response.status, headers }),
+  };
+}
+
 export function createHttpHandler(
   dependencies: ServerDependencies,
 ): HttpHandler {
   return async (request: Request): Promise<Response> => {
-    try {
-      return await routeRequest(request, dependencies);
-    } catch (error: unknown) {
-      return mapApplicationError(error);
+    const logger = dependencies.logger ?? noOpLogger;
+    const requestId = requestIdFrom(
+      request,
+      dependencies.requestIdGenerator ?? (() => crypto.randomUUID()),
+    );
+    const route = routeTemplate(request);
+    const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
+    const startedAt = monotonicNow();
+
+    const execute = async (): Promise<Response> => {
+      let release: (() => void) | null = null;
+      const operationalRoute =
+        route === "/health" ||
+        route === "/health/live" ||
+        route === "/health/ready" ||
+        route === "/metrics";
+      if (dependencies.requestTracker !== undefined) {
+        release = dependencies.requestTracker.begin();
+        if (release === null && !operationalRoute) {
+          return errorResponse(
+            "SERVICE_UNAVAILABLE",
+            "Service is shutting down",
+            503,
+          );
+        }
+      }
+
+      try {
+        return await routeRequest(request, dependencies, requestId);
+      } catch (error: unknown) {
+        return mapApplicationError(error);
+      } finally {
+        release?.();
+      }
+    };
+
+    const rawResponse = await runWithRequestContext({ requestId }, execute);
+    const finalized = await attachRequestId(rawResponse, requestId);
+    const durationMs = Math.max(0, monotonicNow() - startedAt);
+    dependencies.metrics?.recordHttp(
+      request.method,
+      route,
+      finalized.response.status,
+      durationMs / 1_000,
+    );
+    const fields = {
+      requestId,
+      method: request.method,
+      route,
+      status: finalized.response.status,
+      durationMs,
+      ...(finalized.errorCode === undefined
+        ? {}
+        : { errorCode: finalized.errorCode }),
+    };
+    logger.log(
+      finalized.response.status >= 500 ? "error" : "info",
+      finalized.response.status >= 500
+        ? "http.request.failed"
+        : "http.request.completed",
+      fields,
+    );
+    if (finalized.errorCode === "IDEMPOTENCY_KEY_CONFLICT") {
+      logger.log("warn", "idempotency.conflict", { requestId });
+    } else if (
+      finalized.errorCode === "IDEMPOTENCY_OPERATION_IN_PROGRESS"
+    ) {
+      logger.log("info", "idempotency.processing", { requestId });
     }
+    return finalized.response;
   };
 }
 

@@ -32,6 +32,7 @@ const validBody = JSON.stringify({
 });
 const validApiKey = "test-service-api-key-000000000001";
 const authorization = `Bearer ${validApiKey}`;
+const requestId = "00000000-0000-4000-8000-000000000099";
 
 function dependencies() {
   return {
@@ -40,6 +41,7 @@ function dependencies() {
         apiKey === validApiKey ? { id: "service-a" } : null,
     },
     maxBodyBytes: 16_384,
+    requestIdGenerator: () => requestId,
     createTransaction: {
       execute: async () => ({ transaction, created: true }),
     },
@@ -118,6 +120,7 @@ describe("createHttpHandler", () => {
       error: {
         code: "TRANSACTION_NOT_FOUND",
         message: "Transaction not found",
+        requestId,
       },
     });
   });
@@ -163,6 +166,7 @@ describe("createHttpHandler", () => {
       error: {
         code: "IDEMPOTENCY_KEY_CONFLICT",
         message: "Idempotency key was already used for a different transaction",
+        requestId,
       },
     });
   });
@@ -197,6 +201,7 @@ describe("createHttpHandler", () => {
       error: {
         code: "RATE_LIMIT_EXCEEDED",
         message: "Too many requests",
+        requestId,
       },
     });
   });
@@ -211,7 +216,7 @@ describe("createHttpHandler", () => {
 
     expect(response.status).toBe(500);
     expect(bodyText).toBe(
-      '{"error":{"code":"INTERNAL_ERROR","message":"Internal server error"}}',
+      `{"error":{"code":"INTERNAL_ERROR","message":"Internal server error","requestId":"${requestId}"}}`,
     );
     expect(bodyText).not.toContain("sensitive database detail");
     expect(bodyText).not.toContain("stack");

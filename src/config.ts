@@ -39,6 +39,8 @@ export type ApplicationConfig = {
   processingStaleTimeoutMs: number;
   executionOverheadMs: number;
   minimumStaleMarginMs: number;
+  readinessTimeoutMs: number;
+  shutdownGracePeriodMs: number;
 };
 
 function serviceCredentials(
@@ -210,9 +212,27 @@ export function loadConfig(
       "IDEMPOTENCY_MINIMUM_STALE_MARGIN_MS",
       3_000,
     ),
+    readinessTimeoutMs: positiveInteger(
+      environment,
+      "READINESS_TIMEOUT_MS",
+      500,
+    ),
+    shutdownGracePeriodMs: positiveInteger(
+      environment,
+      "SHUTDOWN_GRACE_PERIOD_MS",
+      15_000,
+    ),
   };
 
-  validateProviderTiming(timing(config));
+  const providerTiming = validateProviderTiming(timing(config));
+  if (
+    config.shutdownGracePeriodMs <
+    providerTiming.maximumProviderExecutionWindowMs
+  ) {
+    throw new Error(
+      "Shutdown grace period must cover the maximum provider execution window",
+    );
+  }
   validateCircuitBreakerConfig(config.breaker);
   return config;
 }

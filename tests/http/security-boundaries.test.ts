@@ -22,6 +22,7 @@ const validBody = JSON.stringify({
   currency: "BRL",
   description: "Order 123",
 });
+const generatedRequestId = "00000000-0000-4000-8000-000000000098";
 
 type Dependencies = Parameters<typeof createHttpHandler>[0];
 
@@ -40,6 +41,7 @@ function dependencies(): Dependencies & {
     calls,
     authenticator: authenticator(),
     maxBodyBytes: 16_384,
+    requestIdGenerator: () => generatedRequestId,
     createTransaction: {
       execute: async () => {
         calls.create += 1;
@@ -111,7 +113,7 @@ describe("service authentication boundary", () => {
       expect(response.status).toBe(401);
       expect(response.headers.get("WWW-Authenticate")).toBe("Bearer");
       expect(text).toBe(
-        '{"error":{"code":"UNAUTHORIZED","message":"Authentication required"}}',
+        `{"error":{"code":"UNAUTHORIZED","message":"Authentication required","requestId":"${generatedRequestId}"}}`,
       );
       expect(text).not.toContain(serviceAKey);
       expect(deps.calls.rate).toEqual([]);
@@ -238,6 +240,7 @@ describe("request body boundary", () => {
       error: {
         code: "PAYLOAD_TOO_LARGE",
         message: "Request body is too large",
+        requestId: generatedRequestId,
       },
     });
     expect(deps.calls.create).toBe(0);
@@ -380,7 +383,7 @@ describe("strict input and safe failure boundaries", () => {
 
       expect(response.status).toBe(500);
       expect(text).toBe(
-        '{"error":{"code":"INTERNAL_ERROR","message":"Internal server error"}}',
+        `{"error":{"code":"INTERNAL_ERROR","message":"Internal server error","requestId":"${generatedRequestId}"}}`,
       );
       expect(text).not.toContain(value);
       expect(text).not.toContain("stack");

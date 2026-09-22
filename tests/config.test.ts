@@ -30,6 +30,8 @@ describe("loadConfig", () => {
     expect(config.rateLimitMaxRequests).toBe(5);
     expect(config.rateLimitWindowMs).toBe(60_000);
     expect(config.httpMaxBodyBytes).toBe(16_384);
+    expect(config.readinessTimeoutMs).toBe(500);
+    expect(config.shutdownGracePeriodMs).toBe(15_000);
     expect(config.serviceCredentials).toEqual([
       { serviceId: "test-service", apiKeySha256: "a".repeat(64) },
     ]);
@@ -111,5 +113,16 @@ describe("loadConfig", () => {
         HTTP_MAX_BODY_BYTES: "0",
       }),
     ).toThrow("positive safe integer");
+  });
+
+  test("requires the shutdown grace period to cover provider execution", () => {
+    expect(() =>
+      loadConfig({
+        DATABASE_URL: "postgres://localhost/test",
+        REDIS_URL: "redis://localhost:6379",
+        SERVICE_CREDENTIALS: serviceCredentials,
+        SHUTDOWN_GRACE_PERIOD_MS: "10000",
+      }),
+    ).toThrow("Shutdown grace period");
   });
 });
