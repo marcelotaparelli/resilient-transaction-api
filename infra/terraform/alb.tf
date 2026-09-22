@@ -34,7 +34,9 @@ resource "aws_lb_target_group" "api" {
 }
 
 resource "aws_lb_listener" "http_forward" {
-  count             = var.acm_certificate_arn == null ? 1 : 0
+  # No unauthenticated HTTP fallback: the lab must receive an ACM ARN before
+  # any public listener is created.
+  count             = 0
   load_balancer_arn = aws_lb.api.arn
   port              = 80
   protocol          = "HTTP"
