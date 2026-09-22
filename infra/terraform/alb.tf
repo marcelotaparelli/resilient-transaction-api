@@ -6,6 +6,13 @@ resource "aws_lb" "api" {
   subnets            = aws_subnet.public[*].id
 }
 
+check "https_certificate_required" {
+  assert {
+    condition     = var.acm_certificate_arn != null && trimspace(coalesce(var.acm_certificate_arn, "")) != ""
+    error_message = "Provide an existing ACM certificate ARN before applying the public lab."
+  }
+}
+
 resource "aws_lb_target_group" "api" {
   name        = substr(replace(local.name_prefix, "_", "-"), 0, 32)
   port        = var.api_container_port

@@ -27,7 +27,7 @@ resource "aws_ecs_task_definition" "api" {
       environment = [
         { name = "HTTP_HOST", value = "0.0.0.0" },
         { name = "PORT", value = tostring(var.api_container_port) },
-        { name = "PROVIDER_URL", value = var.provider_url },
+        { name = "PROVIDER_URL", value = "http://127.0.0.1:4003/transactions" },
       ]
       secrets = [
         { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
@@ -50,6 +50,31 @@ resource "aws_ecs_task_definition" "api" {
           awslogs-stream-prefix = "api"
         }
       }
+    },
+    {
+      name                   = "fake-provider"
+      image                  = "${aws_ecr_repository.api.repository_url}:${var.fake_provider_image_tag}"
+      essential              = true
+      user                   = "bun"
+      readonlyRootFilesystem = true
+      portMappings = [{
+        containerPort = 4003
+        hostPort      = 4003
+        protocol      = "tcp"
+      }]
+      environment = [
+        { name = "PROVIDER_OUTCOMES", value = "success" },
+        { name = "PROVIDER_LATENCY_MS", value = "0" },
+        { name = "PROVIDER_TIMEOUT_DELAY_MS", value = "60000" },
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.api.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "provider"
+        }
+      }
     }
   ])
 }
@@ -67,9 +92,9 @@ resource "aws_ecs_service" "api" {
   deployment_maximum_percent         = 200
 
   network_configuration {
-    subnets          = aws_subnet.private[*].id
+    subnets          = var.use_private_tasks ? aws_subnet.private[*].id : aws_subnet.public[*].id
     security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = false
+    assign_public_ip = !var.use_private_tasks
   }
 
   load_balancer {

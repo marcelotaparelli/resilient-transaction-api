@@ -10,6 +10,17 @@ subnets, and one NAT Gateway for outbound provider traffic. The single NAT is a
 portfolio cost trade-off, not a high-availability claim. RDS and ElastiCache
 are private and reachable only from the ECS task security group.
 
+For a cheaper temporary lab, set `use_private_tasks = false`. Tasks then run in
+public subnets with public IPs, but their security group still accepts inbound
+traffic only from the ALB; RDS and Redis remain private. This avoids the NAT
+Gateway charge while weakening the network posture compared with the preferred
+private-task topology. Production should use private tasks with deliberate
+egress.
+
+The API and deterministic fake provider run as two containers in one ECS task.
+The API calls `127.0.0.1:4003`; this sidecar is lab infrastructure only. A real
+deployment would call the external payment provider instead.
+
 Before a future apply, an operator must:
 
 1. install a compatible Terraform and AWS provider;

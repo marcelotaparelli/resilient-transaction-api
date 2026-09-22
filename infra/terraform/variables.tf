@@ -35,6 +35,12 @@ variable "container_image_tag" {
   default     = "latest"
 }
 
+variable "fake_provider_image_tag" {
+  description = "ECR tag for the deterministic fake-provider sidecar image."
+  type        = string
+  default     = "provider-latest"
+}
+
 variable "provider_url" {
   description = "External payment provider URL. Supply a real HTTPS endpoint before apply."
   type        = string
@@ -61,6 +67,12 @@ variable "task_memory" {
 variable "desired_count" {
   type    = number
   default = 1
+}
+
+variable "use_private_tasks" {
+  description = "Production-preferred mode. Set false for a lower-cost lab with public IP tasks and ALB-only ingress."
+  type        = bool
+  default     = true
 }
 
 variable "acm_certificate_arn" {
