@@ -25,7 +25,7 @@ Before a future apply, an operator must:
 
 1. install a compatible Terraform and AWS provider;
 2. select an AWS account and region deliberately;
-3. bootstrap the four Secrets Manager values referenced by the task;
+3. bootstrap the three Secrets Manager values referenced by the task;
 4. provide a real provider URL and an existing ACM certificate ARN;
 5. decide whether the Redis transit-encryption/auth-token configuration is
    appropriate for the account;

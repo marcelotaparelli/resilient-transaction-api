@@ -25,7 +25,6 @@ data "aws_iam_policy_document" "execution_secrets" {
       aws_secretsmanager_secret.database_url.arn,
       aws_secretsmanager_secret.redis_url.arn,
       aws_secretsmanager_secret.service_credentials.arn,
-      aws_secretsmanager_secret.provider_credentials.arn,
     ]
   }
 }
