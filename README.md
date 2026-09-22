@@ -113,6 +113,8 @@ Há um índice correspondente. A paginação continua baseada em `page` e `limit
 
 - `GET /health`
 - `GET /health/live`
+- `GET /health/ready`
+- `GET /metrics`
 - `POST /transactions`
 - `GET /transactions/:id`
 - `GET /transactions?page=1&limit=20`
@@ -141,6 +143,37 @@ Erros preservam o envelope:
 SQL, connection strings, erros brutos, nomes internos e stack traces não são enviados ao cliente. Erros desconhecidos sempre retornam `500 INTERNAL_ERROR`. Campos de log que possam conter Authorization, API keys, credentials, secrets, URLs de PostgreSQL/Redis, Idempotency-Key ou payload completo passam por redaction centralizada. O logging estruturado completo continua reservado à fase de observabilidade.
 
 A revisão da Fase 5 confirmou que inputs usados pelo repository continuam em tagged templates parametrizados do `Bun.SQL`; `sql.unsafe` recebe somente migrations versionadas e SQL estático de setup de testes. URL, timeout, retry e credentials do provider vêm da configuração validada no composition root e não podem ser alterados pelo caller. Prefixos Redis são validados, o `serviceId` é bounded e codificado, IDs de transação são validados antes do cache e payloads cacheados continuam sujeitos ao schema estrito.
+
+## Observabilidade e lifecycle
+
+Toda request recebe um UUID em `X-Request-Id`. Um UUID válido fornecido pelo caller é preservado; valores ausentes, inválidos ou oversized são substituídos por um UUID gerado. O mesmo valor aparece no response header, no envelope de erro e nos logs, e é propagado ao provider como correlation header. Ele não substitui a `Idempotency-Key`.
+
+Logs usam um objeto JSON por linha e uma allowlist de campos: timestamp, level, event, requestId, method, route template, status, duration, código público de erro, operation, attempt e delays operacionais. `serviceId` não é logado. Headers, bodies, errors, stack, credentials, URLs privadas e idempotency keys não são serializados. Durações usam `performance.now()` monotônico; timestamps usam wall clock.
+
+Política de níveis:
+
+- `info`: conclusão HTTP normal, cache hit/miss, startup, shutdown e fechamento do breaker;
+- `warn`: autenticação inválida, 429, retry, cache/Redis degradado, falha esperada do provider e abertura do breaker;
+- `error`: HTTP 5xx inesperado, PostgreSQL indisponível e falhas durante teardown.
+
+`GET /metrics` é público e expõe somente métricas locais não sensíveis em formato Prometheus. Os counters zeram no restart. As labels aceitas são bounded: method, route template, status/status class, categoria fixa de provider e operation fixa. Métodos ou rotas fora das allowlists viram `OTHER` ou `unmatched`. UUIDs, IDs de transação, serviceId, requestId, Idempotency-Key, raw paths e mensagens nunca são labels.
+
+Métricas atuais:
+
+- `http_requests_total`, `http_errors_total` e `http_request_duration_seconds`;
+- `provider_requests_total`, `provider_failures_total`, `provider_timeouts_total` e `provider_retries_total`;
+- `circuit_open_total`;
+- `cache_hit_total`, `cache_miss_total` e `cache_error_total`;
+- `rate_limit_rejected_total`;
+- `redis_errors_total` e `database_errors_total`.
+
+`http_errors_total` inclui 4xx e 5xx, separados pela label `class`. O histograma HTTP usa buckets cumulativos fixos de 5 ms, 10 ms, 25 ms, 50 ms, 100 ms, 250 ms, 500 ms, 1 s, 2,5 s, 5 s e 10 s. `provider_requests_total` conta attempts HTTP externos reais, não apenas operações lógicas.
+
+Liveness não consulta dependências. Readiness executa `SELECT 1` e `PING`, cada probe com deadline default de 500 ms: PostgreSQL down retorna `503 {"status":"not_ready"}`; Redis down retorna `200 {"status":"degraded"}`; provider não participa do readiness. PostgreSQL é crítico, enquanto Redis preserva a semântica fail-open definida para cache e rate limit.
+
+SIGTERM e SIGINT iniciam o mesmo shutdown idempotente: readiness muda para not ready, novas requests de negócio recebem 503, Bun para de admitir conexões, requests em andamento drenam dentro do grace period, e Redis/PostgreSQL são fechados explicitamente. O default de 15 segundos cobre a janela máxima configurada do provider de 12,8 segundos, deixando 2,2 segundos de margem. Após o limite, o HTTP é encerrado de forma forçada. Cada operação de force-close/close tem ainda um deadline interno de 1 segundo, e o teardown continua se ela falhar ou não resolver; no pior caso configurado, o coordinator termina em aproximadamente 18 segundos.
+
+As decisões estão registradas em [ADR 0005](docs/adr/0005-local-observability-and-process-lifecycle.md).
 
 ## Redis: responsabilidades e limites
 
@@ -230,6 +263,8 @@ O fake provider mantém sua própria idempotência em memória. Nos cenários `t
 | --- | ---: |
 | `SERVICE_CREDENTIALS` | obrigatório; JSON sem default |
 | `HTTP_MAX_BODY_BYTES` | `16384` |
+| `READINESS_TIMEOUT_MS` | `500` |
+| `SHUTDOWN_GRACE_PERIOD_MS` | `15000` |
 | `PROVIDER_URL` | `http://localhost:4003/transactions` |
 | `PROVIDER_TIMEOUT_MS` | `3000` |
 | `PROVIDER_MAX_ATTEMPTS` | `3` |
@@ -320,5 +355,8 @@ A suíte de integração aplica migrations a partir de vazio, testa constraints,
 - o cliente Redis nativo não suporta Redis Cluster ou Sentinel;
 - o circuit breaker é local por réplica e perde estado no restart;
 - clocks pausados, clock skew extremo ou stalls do runtime ainda podem ultrapassar a margem do stale timeout;
-- não há observabilidade avançada ou graceful shutdown;
+- não há tracing distribuído, log shipping, collector de métricas ou dashboards;
+- métricas, logs e breaker são locais por réplica e perdem estado no restart;
+- o timeout de readiness limita a espera HTTP, mas não garante cancelamento de comando já enviado;
+- shutdown é bounded e pode interromper trabalho que ultrapasse o grace period;
 - não há Docker ou infraestrutura AWS.
