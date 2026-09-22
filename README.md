@@ -385,6 +385,49 @@ no stack Docker local, com ambiente e limitações completos, está em
 com resultados JSONL em `artifacts/benchmarks/`. Os números são locais e não
 representam AWS ou produção; não foram aplicadas otimizações sem evidência.
 
+## Arquitetura AWS definida (Fase 9)
+
+O Terraform em [`infra/terraform`](infra/terraform) descreve a topologia alvo;
+nenhum recurso AWS foi criado nesta fase. O desenho é:
+
+```text
+Internet
+   ↓ HTTPS (ACM existente)
+Application Load Balancer (subnets públicas)
+   ↓ /health/ready
+ECS/Fargate API (subnets privadas, non-root)
+   ├── RDS PostgreSQL 15 (privado, source of truth)
+   ├── ElastiCache Redis OSS (privado, cache + rate limit)
+   ├── Secrets Manager (referências sem valores no Terraform)
+   └── CloudWatch Logs
+            ↓ egress via NAT Gateway
+       External payment provider
+```
+
+O ALB só encaminha para tasks saudáveis pelo readiness. PostgreSQL é crítico
+para readiness; Redis continua degradável conforme a política local. O serviço
+usa duas AZs, private subnets para tasks/RDS/Redis e um NAT Gateway para chamar
+o provider externo. Um NAT reduz custo fixo no ambiente de portfólio, mas não é
+uma alegação de alta disponibilidade; produção deve reavaliar egress por AZ.
+
+ECS/Fargate foi escolhido porque o case demonstra um serviço HTTP containerizado
+de longa duração, pools de conexão, concorrência, readiness e graceful
+shutdown. A task usa a imagem imutável do ECR, `stopTimeout` de 20 segundos e
+mantém o grace period de 15 segundos da aplicação. Logs continuam em stdout e
+vão para CloudWatch Logs; `/metrics` existe, mas não há scraping Prometheus
+configurado nesta fase.
+
+As credenciais são referências a Secrets Manager e precisam ser inicializadas
+fora do Terraform. Não há valores secretos em `.tf`, `tfvars`, imagem ou
+environment plaintext da task. A execution role lê ECR, logs e secrets; a task
+role não possui permissões AWS porque o código não chama APIs AWS.
+
+Principais custos contínuos a avaliar antes de aplicar: Fargate, ALB, NAT
+Gateway, RDS, ElastiCache, CloudWatch Logs, ECR e transferência de dados. Os
+valores dependem de região, capacidade e retenção; esta fase não publica preço
+inventado. O ADR está em
+[`docs/adr/0007-aws-fargate-terraform-architecture.md`](docs/adr/0007-aws-fargate-terraform-architecture.md).
+
 ## Limitações atuais
 
 - a correção do side effect externo depende da idempotência oferecida pelo provider;

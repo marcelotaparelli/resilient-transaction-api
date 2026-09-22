@@ -1,0 +1,10 @@
+aws_region       = "us-east-1"
+environment      = "portfolio"
+container_image_tag = "<git-commit-sha>"
+
+# Required before a real apply if HTTPS is desired. The certificate itself is
+# intentionally managed outside this stack.
+acm_certificate_arn = null
+
+# Supply out-of-band only; never commit a real token in this file.
+redis_auth_token = null
