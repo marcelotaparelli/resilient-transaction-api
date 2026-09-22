@@ -11,6 +11,8 @@ import {
   HttpPaymentProvider,
   type TimeoutScheduler,
 } from "../../src/infrastructure/providers/http-payment-provider";
+import { ApplicationMetrics } from "../../src/infrastructure/observability/metrics";
+import { runWithRequestContext } from "../../src/infrastructure/observability/request-context";
 
 const transaction = {
   amount: 1099,
@@ -37,6 +39,7 @@ class ManualTimeoutScheduler implements TimeoutScheduler {
 describe("HttpPaymentProvider", () => {
   test("sends one request with the provider idempotency key", async () => {
     const requests: Request[] = [];
+    const metrics = new ApplicationMetrics();
     const provider = new HttpPaymentProvider(
       "http://provider/transactions",
       3_000,
@@ -47,14 +50,23 @@ describe("HttpPaymentProvider", () => {
           decision: "approved",
         });
       },
+      undefined,
+      metrics,
     );
 
-    expect(await provider.process(transaction, "same-key")).toEqual({
+    expect(await runWithRequestContext(
+      { requestId: "00000000-0000-4000-8000-000000000080" },
+      () => provider.process(transaction, "same-key"),
+    )).toEqual({
       providerTransactionId: "provider-1",
       decision: "approved",
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]?.headers.get("Idempotency-Key")).toBe("same-key");
+    expect(requests[0]?.headers.get("X-Request-Id")).toBe(
+      "00000000-0000-4000-8000-000000000080",
+    );
+    expect(metrics.value("provider_requests_total")).toBe(1);
   });
 
   test("classifies provider status codes without retrying in the HTTP adapter", async () => {
@@ -112,6 +124,7 @@ describe("HttpPaymentProvider", () => {
   test("aborts a hanging request using a deterministic timeout scheduler", async () => {
     const scheduler = new ManualTimeoutScheduler();
     let observedSignal: AbortSignal | null = null;
+    const metrics = new ApplicationMetrics();
     const provider = new HttpPaymentProvider(
       "http://provider/transactions",
       3_000,
@@ -124,6 +137,7 @@ describe("HttpPaymentProvider", () => {
         });
       },
       scheduler,
+      metrics,
     );
 
     const pending = provider.process(transaction, "same-key");
@@ -133,6 +147,9 @@ describe("HttpPaymentProvider", () => {
     await expect(pending).rejects.toBeInstanceOf(ProviderTimeoutError);
     expect((observedSignal as AbortSignal | null)?.aborted).toBeTrue();
     expect(scheduler.cancelled).toBeTrue();
+    expect(metrics.value("provider_requests_total")).toBe(1);
+    expect(metrics.value("provider_timeouts_total")).toBe(1);
+    expect(metrics.value("provider_failures_total", { category: "timeout" })).toBe(1);
   });
 
   test("classifies transport exceptions as network failures", async () => {

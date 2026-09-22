@@ -21,6 +21,8 @@ import {
   type RandomSource,
   type Sleeper,
 } from "../../src/infrastructure/providers/retry-policy";
+import { ApplicationMetrics } from "../../src/infrastructure/observability/metrics";
+import type { OperationalLogger } from "../../src/infrastructure/observability/logger";
 
 const transaction: TransactionInput = {
   amount: 1099,
@@ -87,7 +89,13 @@ class SequenceRandom implements RandomSource {
 
 function subject(
   outcomes: (ProviderResult | Error)[],
-  options: { threshold?: number; random?: number[]; clock?: FixedClock } = {},
+  options: {
+    threshold?: number;
+    random?: number[];
+    clock?: FixedClock;
+    metrics?: ApplicationMetrics;
+    logger?: OperationalLogger;
+  } = {},
 ) {
   const provider = new SequenceProvider(outcomes);
   const sleeper = new RecordingSleeper();
@@ -111,6 +119,8 @@ function subject(
     breaker,
     sleeper,
     new SequenceRandom(options.random ?? [0, 0]),
+    options.metrics,
+    options.logger,
   );
   return { provider, sleeper, clock, breaker, resilient };
 }
@@ -126,10 +136,11 @@ describe("ResilientPaymentProvider", () => {
   });
 
   test("retries 503 once and preserves the idempotency key", async () => {
+    const metrics = new ApplicationMetrics();
     const { resilient, provider, sleeper } = subject([
       new ProviderServerError(503),
       success,
-    ]);
+    ], { metrics });
 
     expect(await resilient.process(transaction, "same-key")).toEqual(success);
     expect(provider.calls.map((call) => call.idempotencyKey)).toEqual([
@@ -137,6 +148,21 @@ describe("ResilientPaymentProvider", () => {
       "same-key",
     ]);
     expect(sleeper.delays).toEqual([500]);
+    expect(metrics.value("provider_retries_total")).toBe(1);
+  });
+
+  test("emits a safe timeout event for every timed-out attempt", async () => {
+    const events: string[] = [];
+    const { resilient } = subject(
+      [new ProviderTimeoutError(), success],
+      {
+        logger: { log: (_level, event) => events.push(event) },
+      },
+    );
+
+    await resilient.process(transaction, "same-key");
+    expect(events).toContain("provider.timeout");
+    expect(events).toContain("provider.retry");
   });
 
   test("retries two transient failures with exponential jittered delays", async () => {

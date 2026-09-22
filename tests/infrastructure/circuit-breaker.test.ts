@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Clock } from "../../src/application/ports/clock";
 import { CircuitBreaker } from "../../src/infrastructure/providers/circuit-breaker";
+import { ApplicationMetrics } from "../../src/infrastructure/observability/metrics";
 
 class MutableClock implements Clock {
   constructor(private current: Date) {}
@@ -31,6 +32,18 @@ describe("CircuitBreaker", () => {
     breaker.recordFailure(second!);
     expect(breaker.state()).toBe("open");
     expect(breaker.acquire()).toBeNull();
+  });
+
+  test("reports each transition to open for the local instance metric", () => {
+    const metrics = new ApplicationMetrics();
+    const clock = new MutableClock(new Date("2026-01-01T00:00:00.000Z"));
+    const breaker = new CircuitBreaker(
+      { failureThreshold: 1, openDurationMs: 1_000 },
+      clock,
+      { opened: () => metrics.circuitOpened(), closed: () => {} },
+    );
+    breaker.recordFailure(breaker.acquire()!);
+    expect(metrics.value("circuit_open_total")).toBe(1);
   });
 
   test("allows only one half-open probe and closes after success", () => {

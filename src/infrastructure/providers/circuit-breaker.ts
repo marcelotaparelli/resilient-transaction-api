@@ -12,6 +12,11 @@ export type CircuitBreakerConfig = {
   openDurationMs: number;
 };
 
+export type CircuitBreakerObserver = {
+  opened(): void;
+  closed(): void;
+};
+
 export function validateCircuitBreakerConfig(
   config: CircuitBreakerConfig,
 ): void {
@@ -40,6 +45,7 @@ export class CircuitBreaker {
   constructor(
     private readonly config: CircuitBreakerConfig,
     private readonly clock: Clock,
+    private readonly observer?: CircuitBreakerObserver,
   ) {
     validateCircuitBreakerConfig(config);
   }
@@ -134,6 +140,7 @@ export class CircuitBreaker {
     this.consecutiveFailures = 0;
     this.halfOpenProbeInFlight = false;
     this.generation += 1;
+    this.observer?.opened();
   }
 
   private close(): void {
@@ -141,5 +148,6 @@ export class CircuitBreaker {
     this.consecutiveFailures = 0;
     this.halfOpenProbeInFlight = false;
     this.generation += 1;
+    this.observer?.closed();
   }
 }

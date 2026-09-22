@@ -12,6 +12,11 @@ import type {
   ProviderResult,
 } from "../../application/ports/payment-provider";
 import type { TransactionInput } from "../../domain/transaction";
+import type {
+  ApplicationMetrics,
+  ProviderFailureCategory,
+} from "../observability/metrics";
+import { currentRequestId } from "../observability/request-context";
 
 const providerResponseSchema = z
   .object({
@@ -47,6 +52,7 @@ export class HttpPaymentProvider implements PaymentProvider {
     private readonly fetchRequest: FetchRequest = fetch,
     private readonly timeoutScheduler: TimeoutScheduler =
       new RuntimeTimeoutScheduler(),
+    private readonly metrics?: ApplicationMetrics,
   ) {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
       throw new Error("Provider timeout must be a positive safe integer");
@@ -57,7 +63,9 @@ export class HttpPaymentProvider implements PaymentProvider {
     transaction: TransactionInput,
     idempotencyKey: string,
   ): Promise<ProviderResult> {
+    this.metrics?.providerAttempt();
     const controller = new AbortController();
+    const requestId = currentRequestId();
     const timeout = this.timeoutScheduler.schedule(
       () => controller.abort(),
       this.timeoutMs,
@@ -69,6 +77,7 @@ export class HttpPaymentProvider implements PaymentProvider {
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Key": idempotencyKey,
+          ...(requestId === undefined ? {} : { "X-Request-Id": requestId }),
         },
         body: JSON.stringify(transaction),
         signal: controller.signal,
@@ -106,16 +115,28 @@ export class HttpPaymentProvider implements PaymentProvider {
         error instanceof ProviderRejectedError ||
         error instanceof ProviderServerError
       ) {
+        this.metrics?.providerFailure(providerFailureCategory(error));
         throw error;
       }
 
       if (error instanceof Error && error.name === "AbortError") {
+        this.metrics?.providerTimeout();
+        this.metrics?.providerFailure("timeout");
         throw new ProviderTimeoutError();
       }
 
+      this.metrics?.providerFailure("network");
       throw new ProviderNetworkError();
     } finally {
       timeout.cancel();
     }
   }
+}
+
+function providerFailureCategory(error: unknown): ProviderFailureCategory {
+  if (error instanceof ProviderRateLimitedError) return "rate_limited";
+  if (error instanceof ProviderRejectedError) return "rejected";
+  if (error instanceof ProviderServerError) return "server";
+  if (error instanceof ProviderInvalidResponseError) return "invalid_response";
+  return "unknown";
 }
