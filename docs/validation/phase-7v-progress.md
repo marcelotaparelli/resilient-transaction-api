@@ -29,6 +29,7 @@ Date: 2026-09-22
 - With Redis stopped, readiness returned 200 `degraded`, authenticated GET continued through PostgreSQL, and unauthenticated GET remained 401. Redis restoration returned readiness to 200 `ready`.
 - With PostgreSQL stopped, liveness remained 200, readiness returned 503 `not_ready`, and the Docker health status became `unhealthy`. Restoring PostgreSQL returned readiness to 200.
 - A real `docker-compose stop -t 20 api` during a 2-second provider request took 2,310 ms. Logs showed `shutdown.started` with one in-flight request, the request completed with 201, then `shutdown.completed`; the container exited 0 without SIGKILL. A new connection during drain was refused.
+- The Docker `quality` stage passed `tsc --noEmit` and the portable suite. Running that image inside the Compose network with `TEST_DATABASE_URL` and `TEST_REDIS_URL` enabled all integration tests: 164 tests passed, 662 assertions, 0 failures, including 20 PostgreSQL and 11 Redis integration tests.
 
 ## Environment adjustment
 
