@@ -8,7 +8,7 @@ resource "aws_lb" "api" {
 
 check "https_certificate_required" {
   assert {
-    condition     = var.acm_certificate_arn != null && trimspace(coalesce(var.acm_certificate_arn, "")) != ""
+    condition     = var.acm_certificate_arn != null ? trimspace(var.acm_certificate_arn) != "" : false
     error_message = "Provide an existing ACM certificate ARN before applying the public lab."
   }
 }
