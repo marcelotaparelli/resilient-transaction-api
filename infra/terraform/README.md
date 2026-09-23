@@ -1,9 +1,10 @@
 # AWS Terraform target
 
-This directory defines the Phase 9 target architecture. It has not been
-applied. The configuration intentionally creates no secret values and no ACM
-certificate; those inputs must be bootstrapped separately before a real
-deployment.
+This directory defines the Phase 9 target architecture and was used to
+provision a temporary AWS validation lab in `us-east-1`. The lab was validated
+and destroyed afterwards. It was not a production deployment. The
+configuration still creates no secret values and no ACM certificate; those
+inputs are bootstrapped separately.
 
 The default topology has two AZs, public ALB subnets, private ECS/RDS/Redis
 subnets, and one NAT Gateway for outbound provider traffic. The single NAT is a
@@ -21,7 +22,13 @@ The API and deterministic fake provider run as two containers in one ECS task.
 The API calls `127.0.0.1:4003`; this sidecar is lab infrastructure only. A real
 deployment would call the external payment provider instead.
 
-Before a future apply, an operator must:
+The validated lab used `use_private_tasks=false`: ECS tasks ran in public
+subnets with public IPs, while the task security group accepted inbound traffic
+only from the ALB security group. RDS and Redis remained private. The preferred
+production topology remains private ECS tasks with deliberate NAT/VPC endpoint
+egress.
+
+Before another lab apply, an operator must:
 
 1. install a compatible Terraform and AWS provider;
 2. select an AWS account and region deliberately;

@@ -1,0 +1,13 @@
+{
+    "desired": 1,
+    "running": 1,
+    "pending": 0,
+    "deployments": [
+        {
+            "status": "PRIMARY",
+            "running": 1,
+            "pending": 0,
+            "failed": 0
+        }
+    ]
+}

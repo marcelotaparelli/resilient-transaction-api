@@ -18,7 +18,7 @@ resource "aws_db_instance" "postgres" {
   port                        = 5432
   publicly_accessible         = false
   multi_az                    = false
-  backup_retention_period     = 7
+  backup_retention_period     = 1
   deletion_protection         = false
   skip_final_snapshot         = var.rds_skip_final_snapshot
   db_subnet_group_name        = aws_db_subnet_group.postgres.name

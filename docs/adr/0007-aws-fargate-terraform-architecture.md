@@ -2,16 +2,18 @@
 
 ## Status
 
-Proposed. Terraform is defined and statically reviewed; no AWS resource was
-created and `terraform apply` was intentionally not executed.
+Validated in a temporary AWS lab in `us-east-1`, then destroyed. This ADR does
+not claim a production deployment or permanent availability.
 
 ## Decision
 
-The target deployment is an internet-facing Application Load Balancer forwarding
-to an ECS/Fargate service. Tasks run in private subnets and use PostgreSQL on
-private RDS and Redis on private ElastiCache. The API image is pulled from ECR,
-runtime secrets are referenced from Secrets Manager, and stdout/stderr is sent
-to CloudWatch Logs.
+The target deployment is an internet-facing HTTPS Application Load Balancer
+forwarding to an ECS/Fargate service. The temporary lab ran tasks in public
+subnets with public IPs, constrained by an ALB-only inbound security group. The
+preferred production topology remains private task subnets with deliberate
+NAT/VPC endpoint egress. Both topologies use PostgreSQL on private RDS and Redis
+on private ElastiCache. The API image is pulled from ECR, runtime secrets are
+referenced from Secrets Manager, and stdout/stderr is sent to CloudWatch Logs.
 
 RDS remains the source of truth for transactions and idempotency. ElastiCache
 is only the cache and distributed rate limiter, so a Redis outage keeps the API
@@ -20,12 +22,13 @@ VPC and is therefore reached through outbound egress.
 
 ## Network and cost trade-off
 
-The portfolio topology uses two AZs, public ALB subnets, private application
-subnets, and one NAT Gateway for outbound provider calls. One NAT limits fixed
-cost for a small environment but is not an availability claim; a production
-deployment would normally evaluate one NAT per AZ or a deliberate egress
-architecture. RDS and Redis have no public address and their security groups
-accept traffic only from the ECS task security group.
+The preferred topology uses two AZs, public ALB subnets, private application
+subnets, and deliberate egress for outbound provider calls. The temporary lab
+set `use_private_tasks=false`, so it avoided a NAT Gateway and placed Fargate
+tasks in public subnets with public IPs. RDS and Redis had no public address and
+their security groups accepted traffic only from the ECS task security group.
+The lab had one desired task, so it did not validate multi-replica rate-limit
+sharing.
 
 ## Lifecycle
 
@@ -37,7 +40,9 @@ existing timeout, retry and local breaker behavior.
 
 ## Secrets and IAM
 
-Terraform creates empty Secrets Manager containers only. Secret values must be
+Terraform creates empty Secrets Manager containers only. In the lab, secret
+values were inserted through the AWS integration process and were not committed
+to the repository. Secret values must be
 bootstrapped out of band and are never placed in Terraform files, image layers,
 or ECS environment plaintext. The execution role reads ECR/logging/secrets;
 the application task role has no AWS permissions because the application does

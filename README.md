@@ -385,30 +385,39 @@ no stack Docker local, com ambiente e limitações completos, está em
 com resultados JSONL em `artifacts/benchmarks/`. Os números são locais e não
 representam AWS ou produção; não foram aplicadas otimizações sem evidência.
 
-## Arquitetura AWS definida (Fase 9)
+## AWS temporary validation lab (Fase 9)
 
-O Terraform em [`infra/terraform`](infra/terraform) descreve a topologia alvo;
-nenhum recurso AWS foi criado nesta fase. O desenho é:
+O Terraform em [`infra/terraform`](infra/terraform) foi usado para provisionar
+um laboratório AWS temporário em `us-east-1`. A stack foi validada e destruída
+depois dos testes. O desenho efetivamente validado foi:
 
 ```text
 Internet
    ↓ HTTPS (ACM existente)
 Application Load Balancer (subnets públicas)
    ↓ /health/ready
-ECS/Fargate API (subnets privadas, non-root)
+ECS/Fargate API + fake-provider sidecar (public subnets, public IP, non-root)
    ├── RDS PostgreSQL 15 (privado, source of truth)
    ├── ElastiCache Redis OSS (privado, cache + rate limit)
    ├── Secrets Manager (referências sem valores no Terraform)
    └── CloudWatch Logs
-            ↓ egress via NAT Gateway
-       External payment provider
 ```
 
-O ALB só encaminha para tasks saudáveis pelo readiness. PostgreSQL é crítico
-para readiness; Redis continua degradável conforme a política local. O serviço
-usa duas AZs, private subnets para tasks/RDS/Redis e um NAT Gateway para chamar
-o provider externo. Um NAT reduz custo fixo no ambiente de portfólio, mas não é
-uma alegação de alta disponibilidade; produção deve reavaliar egress por AZ.
+O fake provider foi sidecar somente do laboratório; uma implantação real
+chamaria o payment provider externo. O laboratório usou `use_private_tasks=false`
+para evitar NAT Gateway, mantendo RDS e Redis privados e restringindo inbound
+da task ao security group do ALB. A arquitetura preferida para produção continua
+sendo private tasks com egress deliberado por NAT/VPC endpoints.
+
+```text
+Produção preferida:
+ALB público → ECS/Fargate privado → NAT/VPC endpoints → provider externo
+```
+
+O ALB só encaminhou para tasks saudáveis pelo `/health/ready`. PostgreSQL foi
+crítico para readiness; Redis permaneceu degradável. O ECS tinha desired count 1,
+portanto o lab não demonstrou rate limiting compartilhado entre múltiplas
+réplicas.
 
 ECS/Fargate foi escolhido porque o case demonstra um serviço HTTP containerizado
 de longa duração, pools de conexão, concorrência, readiness e graceful
@@ -417,13 +426,15 @@ mantém o grace period de 15 segundos da aplicação. Logs continuam em stdout e
 vão para CloudWatch Logs; `/metrics` existe, mas não há scraping Prometheus
 configurado nesta fase.
 
-As credenciais são referências a Secrets Manager e precisam ser inicializadas
-fora do Terraform. Não há valores secretos em `.tf`, `tfvars`, imagem ou
-environment plaintext da task. A execution role lê ECR, logs e secrets; a task
-role não possui permissões AWS porque o código não chama APIs AWS.
+As credenciais foram entregues à task por Secrets Manager, sem valores secretos
+no Git, Terraform outputs, imagem ou documentação. A execution role leu ECR,
+logs e secrets; a task role não possuiu permissões AWS porque o código não chama
+APIs AWS. As evidências sanitizadas estão em
+[`docs/validation/aws-lab-real.md`](docs/validation/aws-lab-real.md) e
+[`artifacts/aws-lab/`](artifacts/aws-lab/).
 
-Principais custos contínuos a avaliar antes de aplicar: Fargate, ALB, NAT
-Gateway, RDS, ElastiCache, CloudWatch Logs, ECR e transferência de dados. Os
+Principais custos contínuos a avaliar: Fargate, ALB, NAT Gateway (não usado no
+lab), RDS, ElastiCache, CloudWatch Logs, ECR e transferência de dados. Os
 valores dependem de região, capacidade e retenção; esta fase não publica preço
 inventado. O ADR está em
 [`docs/adr/0007-aws-fargate-terraform-architecture.md`](docs/adr/0007-aws-fargate-terraform-architecture.md).

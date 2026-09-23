@@ -1,0 +1,4 @@
+# TYPE cache_hit_total counter
+# TYPE cache_miss_total counter
+cache_hit_total 1
+cache_miss_total 1

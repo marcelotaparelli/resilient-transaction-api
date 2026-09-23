@@ -35,12 +35,11 @@ Date: 2026-09-22
 
 The validation host initially lacked Docker. Its nested filesystem does not support Docker `overlay2`; the fallback `vfs` driver duplicated layers and exhausted the small root filesystem during the PostgreSQL pull. The daemon was restarted with `fuse-overlayfs` and a temporary data root under `/workspace/.docker-runtime`. This is validation infrastructure and is not an application change.
 
-## Still pending
+## Status
 
-- HTTP liveness/readiness response inspection from the host (the host image has no `curl`; use Bun or another existing client).
-- Authenticated POST and GET/cache behavior.
-- Metrics and structured-log inspection.
-- API restart persistence.
-- Redis and PostgreSQL outage behavior and recovery.
-- Real in-flight SIGTERM/graceful shutdown timing.
-- Full portable, PostgreSQL and Redis test suites against the running dependencies.
+The container runtime validation described above is complete. The host did not
+have `curl`, so the checks used Bun and Docker-native inspection instead. The
+authenticated API flow, metrics/log inspection, API restart persistence,
+Redis/PostgreSQL degradation, real SIGTERM drain, and full PostgreSQL/Redis test
+suite are recorded in **Additional runtime evidence** above; they are not
+pending work.
