@@ -105,9 +105,7 @@ Depois da validação:
 - o certificado ACM permaneceu `ISSUED` intencionalmente;
 - o CNAME público `resilient` foi removido.
 
-O certificado ACM remanescente é um recurso deliberadamente preservado e pode
-continuar gerando custo conforme a conta/região. A exclusão dele é uma decisão
-separada porque certificados podem estar associados a outros usos.
+O certificado público ACM permaneceu ISSUED intencionalmente para possível reutilização futura. O certificado ACM público padrão usado com serviços integrados da AWS não possui cobrança adicional; o ALB e os demais recursos do laboratório já foram removidos.
 
 ## Claims públicas suportadas
 
